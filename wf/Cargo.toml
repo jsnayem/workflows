@@ -1,0 +1,12 @@
+[package]
+name = "wf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+serde_json = "1"
+
+[profile.dev]
+opt-level = 0
