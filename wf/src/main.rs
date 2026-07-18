@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 const PROJECTS_ROOT: &str = "/home/nayem/Projects";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const HELP: &str = "1/2/3 tabs | ↑↓ select | Enter action | r refresh | q quit";
 
 #[derive(Debug, Clone)]
 enum Tab {
@@ -37,6 +39,7 @@ struct App {
     secrets: Vec<secrets::Finding>,
     hindsight: hindsight::BankInfo,
     sweep_status: String,
+    confirm_sweep: bool,
     status: String,
 }
 
@@ -67,10 +70,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
 
-    let repos = git::discover(&root)
-        .iter()
-        .map(|p| git::health(p))
-        .collect();
+    let repos = load_repos(&root);
     let secrets_findings = git::discover(&root)
         .iter()
         .flat_map(|p| secrets::scan_repo(p))
@@ -85,7 +85,8 @@ fn main() -> io::Result<()> {
         secrets: secrets_findings,
         hindsight: hi,
         sweep_status: String::new(),
-        status: "q: quit | ←→: tab | ↑↓: select | r: refresh | Enter: action".into(),
+        confirm_sweep: false,
+        status: HELP.into(),
     };
 
     loop {
@@ -93,8 +94,26 @@ fn main() -> io::Result<()> {
         if let Event::Key(key) = event::read()? {
             match key.code {
                 KeyCode::Char('q') => break,
-                KeyCode::Left | KeyCode::Char('h') => app.tab = prev_tab(&app.tab),
-                KeyCode::Right | KeyCode::Char('l') => app.tab = next_tab(&app.tab),
+                KeyCode::Char('1') => {
+                    app.tab = Tab::Projects;
+                    app.confirm_sweep = false;
+                }
+                KeyCode::Char('2') => {
+                    app.tab = Tab::Secrets;
+                    app.confirm_sweep = false;
+                }
+                KeyCode::Char('3') => {
+                    app.tab = Tab::Hindsight;
+                    app.confirm_sweep = false;
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    app.tab = prev_tab(&app.tab);
+                    app.confirm_sweep = false;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    app.tab = next_tab(&app.tab);
+                    app.confirm_sweep = false;
+                }
                 KeyCode::Up => {
                     if app.selected > 0 {
                         app.selected -= 1;
@@ -111,6 +130,12 @@ fn main() -> io::Result<()> {
                     }
                 }
                 KeyCode::Char('r') => refresh(&mut app, &root),
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if app.confirm_sweep {
+                        apply_sweep(&mut app);
+                        app.confirm_sweep = false;
+                    }
+                }
                 KeyCode::Enter => handle_enter(&mut app),
                 _ => {}
             }
@@ -138,13 +163,29 @@ fn next_tab(t: &Tab) -> Tab {
 }
 
 fn refresh(app: &mut App, root: &PathBuf) {
-    app.repos = git::discover(root).iter().map(|p| git::health(p)).collect();
+    app.repos = load_repos(root);
+    if app.selected >= app.repos.len() {
+        app.selected = app.repos.len().saturating_sub(1);
+    }
     app.secrets = git::discover(root)
         .iter()
         .flat_map(|p| secrets::scan_repo(p))
         .collect();
     app.hindsight = hindsight::info();
     app.status = "refreshed".into();
+}
+
+/// Discover + health-check + sort (dirty first, then behind, then ahead, then name).
+fn load_repos(root: &PathBuf) -> Vec<git::Repo> {
+    let mut repos: Vec<git::Repo> = git::discover(root).iter().map(|p| git::health(p)).collect();
+    repos.sort_by(|a, b| {
+        b.dirty
+            .cmp(&a.dirty)
+            .then(b.behind.cmp(&a.behind))
+            .then(b.ahead.cmp(&a.ahead))
+            .then(a.name.cmp(&b.name))
+    });
+    repos
 }
 
 fn handle_enter(app: &mut App) {
@@ -178,13 +219,20 @@ fn handle_enter(app: &mut App) {
             );
         }
         Tab::Hindsight => {
-            // confirm-then-apply sweep
-            let (ok, failed) = hindsight::apply_sweep();
-            app.sweep_status = format!("sweep applied: invalidated={ok} failed={failed}");
-            app.hindsight = hindsight::info();
-            app.status = "hindsight sweep applied".into();
+            // two-step: Enter prompts, Y confirms (mutating action)
+            app.confirm_sweep = true;
+            app.status =
+                "Press Y to APPLY sweep (invalidates stale memories); any other key cancels".into();
         }
     }
+}
+
+/// Mutating: PATCH-invalidate stale world/experience memories (never deletes).
+fn apply_sweep(app: &mut App) {
+    let (ok, failed) = hindsight::apply_sweep();
+    app.sweep_status = format!("sweep applied: invalidated={ok} failed={failed}");
+    app.hindsight = hindsight::info();
+    app.status = format!("hindsight sweep applied (invalidated={ok}, failed={failed})");
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
@@ -194,11 +242,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(size);
 
-    let titles = ["Projects", "Secrets", "Hindsight"];
+    let titles = ["[1] Projects", "[2] Secrets", "[3] Hindsight"];
     let tab_idx = match app.tab {
         Tab::Projects => 0,
         Tab::Secrets => 1,
@@ -206,7 +254,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     };
     let tabs = Tabs::new(titles)
         .select(tab_idx)
-        .block(Block::default().borders(Borders::ALL).title("wf"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("wf v{VERSION}")),
+        )
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(tabs, chunks[0]);
 
@@ -216,7 +268,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Tab::Hindsight => draw_hindsight(f, app, chunks[1]),
     }
 
-    let status = Paragraph::new(app.status.clone()).block(Block::default().borders(Borders::ALL));
+    let footer = format!("{}\n{}", app.status, HELP);
+    let status = Paragraph::new(footer).block(Block::default().borders(Borders::ALL));
     f.render_widget(status, chunks[2]);
 }
 
@@ -261,11 +314,12 @@ fn draw_projects(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
             "last commit",
             "chk",
         ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Projects ({})  Enter: make check", app.repos.len())),
-        );
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Projects ({})  ●dirty:{}  ↓behind:{}  Enter: make check",
+            app.repos.len(),
+            app.repos.iter().filter(|r| r.dirty).count(),
+            app.repos.iter().filter(|r| r.behind > 0).count()
+        )));
     f.render_widget(table, area);
 
     let st = app.check.lock().unwrap();
@@ -321,11 +375,16 @@ fn draw_secrets(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) 
 fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let hi = &app.hindsight;
     let text = format!(
-        "Bank: hermes @ localhost:8888\nTotal memories: {}\nStale candidates (dry-run): {}\n\nObservations mission:\n{}\n\n{}\n\nEnter: APPLY sweep (invalidates stale world/experience memories)",
+        "Bank: hermes @ localhost:8888\nTotal memories: {}\nStale candidates (dry-run): {}\n\nObservations mission:\n{}\n\n{}\n\n{}",
         hi.total_memories,
         hi.stale_candidates,
         hi.observations_mission,
         app.sweep_status,
+        if app.confirm_sweep {
+            "WARNING: press Y to APPLY sweep (invalidates stale world/experience memories). Any other key cancels."
+        } else {
+            "Enter: review the stale-memory sweep (asks for confirmation before applying)."
+        },
     );
     let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Hindsight"));
     f.render_widget(p, area);
