@@ -20,14 +20,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 const PROJECTS_ROOT: &str = "/home/nayem/Projects";
+const BACKUP_SH: &str = "/home/nayem/Projects/workflows/backup.sh";
+const BACKUP_DIR: &str = "/home/nayem/Projects/Backups";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const HELP: &str = "1/2/3 tabs | ↑↓ select | Enter action | r refresh | q quit";
+const HELP: &str = "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | q quit";
 
 #[derive(Debug, Clone)]
 enum Tab {
     Projects,
     Secrets,
     Hindsight,
+    Backup,
 }
 
 struct App {
@@ -39,6 +42,8 @@ struct App {
     secrets: Vec<secrets::Finding>,
     hindsight: hindsight::BankInfo,
     sweep_status: String,
+    backup: Arc<Mutex<CheckState>>,
+    backup_list: String,
     confirm_sweep: bool,
     status: String,
 }
@@ -85,6 +90,8 @@ fn main() -> io::Result<()> {
         secrets: secrets_findings,
         hindsight: hi,
         sweep_status: String::new(),
+        backup: Arc::new(Mutex::new(CheckState::default())),
+        backup_list: backup_snapshot(),
         confirm_sweep: false,
         status: HELP.into(),
     };
@@ -106,6 +113,10 @@ fn main() -> io::Result<()> {
                     app.tab = Tab::Hindsight;
                     app.confirm_sweep = false;
                 }
+                KeyCode::Char('4') => {
+                    app.tab = Tab::Backup;
+                    app.confirm_sweep = false;
+                }
                 KeyCode::Left | KeyCode::Char('h') => {
                     app.tab = prev_tab(&app.tab);
                     app.confirm_sweep = false;
@@ -124,6 +135,7 @@ fn main() -> io::Result<()> {
                         Tab::Projects => app.repos.len(),
                         Tab::Secrets => app.secrets.len(),
                         Tab::Hindsight => 1,
+                        Tab::Backup => 1,
                     };
                     if n > 0 && app.selected < n - 1 {
                         app.selected += 1;
@@ -149,16 +161,18 @@ fn main() -> io::Result<()> {
 
 fn prev_tab(t: &Tab) -> Tab {
     match t {
-        Tab::Projects => Tab::Hindsight,
+        Tab::Projects => Tab::Backup,
         Tab::Secrets => Tab::Projects,
         Tab::Hindsight => Tab::Secrets,
+        Tab::Backup => Tab::Hindsight,
     }
 }
 fn next_tab(t: &Tab) -> Tab {
     match t {
         Tab::Projects => Tab::Secrets,
         Tab::Secrets => Tab::Hindsight,
-        Tab::Hindsight => Tab::Projects,
+        Tab::Hindsight => Tab::Backup,
+        Tab::Backup => Tab::Projects,
     }
 }
 
@@ -172,6 +186,7 @@ fn refresh(app: &mut App, root: &PathBuf) {
         .flat_map(|p| secrets::scan_repo(p))
         .collect();
     app.hindsight = hindsight::info();
+    app.backup_list = backup_snapshot();
     app.status = "refreshed".into();
 }
 
@@ -224,6 +239,34 @@ fn handle_enter(app: &mut App) {
             app.status =
                 "Press Y to APPLY sweep (invalidates stale memories); any other key cancels".into();
         }
+        Tab::Backup => {
+            let sh = BACKUP_SH.to_string();
+            let cmd = Arc::clone(&app.backup);
+            {
+                let mut st = cmd.lock().unwrap();
+                st.running = true;
+                st.output.clear();
+            }
+            app.status = "running backup.sh (pulls cs/ss -> ~/Projects/Backups)…".into();
+            thread::spawn(move || {
+                let out = std::process::Command::new("bash").arg(&sh).output();
+                let text = match out {
+                    Ok(o) => {
+                        let mut s = String::from_utf8_lossy(&o.stdout).to_string();
+                        s.push_str(&String::from_utf8_lossy(&o.stderr));
+                        if s.trim().is_empty() {
+                            "done (no output)".into()
+                        } else {
+                            s
+                        }
+                    }
+                    Err(e) => format!("failed to run backup.sh: {e}"),
+                };
+                let mut st = cmd.lock().unwrap();
+                st.running = false;
+                st.output = text;
+            });
+        }
     }
 }
 
@@ -233,6 +276,20 @@ fn apply_sweep(app: &mut App) {
     app.sweep_status = format!("sweep applied: invalidated={ok} failed={failed}");
     app.hindsight = hindsight::info();
     app.status = format!("hindsight sweep applied (invalidated={ok}, failed={failed})");
+}
+
+/// Snapshot of the local backup dir for the Backup tab (read-only `ls`).
+fn backup_snapshot() -> String {
+    let out = std::process::Command::new("bash")
+        .args([
+            "-c",
+            &format!("ls -lt {} 2>/dev/null | head -8", BACKUP_DIR),
+        ])
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => "(backup dir unreadable)".into(),
+    }
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
@@ -246,11 +303,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(size);
 
-    let titles = ["[1] Projects", "[2] Secrets", "[3] Hindsight"];
+    let titles = ["[1] Projects", "[2] Secrets", "[3] Hindsight", "[4] Backup"];
     let tab_idx = match app.tab {
         Tab::Projects => 0,
         Tab::Secrets => 1,
         Tab::Hindsight => 2,
+        Tab::Backup => 3,
     };
     // Tabs renders its labels on a single line. No bordered Block wrapper:
     // a bordered Block would consume the row and clip the labels.
@@ -263,6 +321,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Tab::Projects => draw_projects(f, app, chunks[1]),
         Tab::Secrets => draw_secrets(f, app, chunks[1]),
         Tab::Hindsight => draw_hindsight(f, app, chunks[1]),
+        Tab::Backup => draw_backup(f, app, chunks[1]),
     }
 
     let footer = format!("wf v{VERSION}  |  {}\n{}", app.status, HELP);
@@ -387,6 +446,34 @@ fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
     f.render_widget(p, area);
 }
 
+fn draw_backup(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let body = format!(
+        "Backup SOP: {}\n\nRuns the existing backup.sh — rsync media + sqlite VACUUM dump\nfrom remote servers cs/ss -> {}.\n\nEnter: run backup (pulls remote -> local)\n\nLocal backups in {}:\n{}",
+        BACKUP_SH,
+        BACKUP_DIR,
+        BACKUP_DIR,
+        app.backup_list,
+    );
+    let p = Paragraph::new(body).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("[4] Backup  Enter: run backup.sh"),
+    );
+    f.render_widget(p, area);
+
+    let st = app.backup.lock().unwrap();
+    if st.running || !st.output.is_empty() {
+        let head = if st.running {
+            "running backup.sh…"
+        } else {
+            "backup.sh output:"
+        };
+        let popup = Paragraph::new(format!("{head}\n{}", st.output))
+            .block(Block::default().borders(Borders::ALL).title("Backup"));
+        f.render_widget(popup, centered_rect(70, 70, area));
+    }
+}
+
 fn centered_rect(
     percent_x: u16,
     percent_y: u16,
@@ -464,6 +551,8 @@ mod tests {
             secrets: vec![],
             hindsight: hindsight::BankInfo::default(),
             sweep_status: String::new(),
+            backup: Arc::new(Mutex::new(CheckState::default())),
+            backup_list: String::new(),
             confirm_sweep: false,
             status: String::new(),
         }
@@ -498,6 +587,9 @@ mod tests {
             rendered.contains("[3] Hindsight"),
             "Hindsight tab label missing from render:\n{rendered}"
         );
+        assert!(
+            rendered.contains("[4] Backup"),
+            "Backup tab label missing from render:\n{rendered}"
+        );
     }
 }
-

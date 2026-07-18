@@ -12,13 +12,14 @@ cargo build --release
 ```
 ./target/debug/wf
 ```
-Tabs: **Projects | Secrets | Hindsight**
-- `←/→` or `h/l` — switch tab
+Tabs: **[1] Projects | [2] Secrets | [3] Hindsight | [4] Backup** (press the digit to jump)
+- `←/→` or `h/l` — cycle tabs
 - `↑/↓` — move selection
 - `Enter` — action:
   - Projects: run `make check` (or `cargo check`) on the selected repo (in a worker thread; result pops up)
   - Secrets: show scan summary
   - Hindsight: **apply** the stale-memory sweep (PATCH-invalidates uncorrected stale world/experience memories)
+  - Backup: **run** `backup.sh` (pulls remote `cs`/`ss` → `~/Projects/Backups`; output pops up)
 - `r` — refresh all panels
 - `q` — quit
 
@@ -43,9 +44,15 @@ wf --hindsight   # bank totals + dry-run stale count + observations_mission
   totals and a **dry-run** stale count. Apply (Enter) PATCH-invalidates stale
   world/experience memories using the correction-aware logic (it never deletes
   observations — those regenerate per the `observations_mission`).
+- **Backup**: launches the existing `backup.sh` SOP (rsync media + sqlite
+  `VACUUM` dump from remote servers `cs`/`ss` into `~/Projects/Backups`).
+  Shows a snapshot of the local backup dir; `Enter` runs the script and
+  streams its output into a popup. The remote IP/SSH config stays in the
+  (untracked) `backup.sh` — never hardcoded here.
 
 ## Scope / safety
-- Read-only by default. The only mutating action is the Hindsight sweep
-  (Enter on that tab), which invalidates — never deletes — memories.
-- No network beyond localhost:8888 (Hindsight) and localhost git.
+- Read-only by default. Mutating actions are gated: Hindsight sweep needs a
+  confirm (`Y`), and Backup runs the existing trusted `backup.sh` on demand.
+- No network beyond localhost:8888 (Hindsight) and localhost git / SSH to the
+  configured backup hosts.
 - The `workflows` repo's own `.gitignore` / secrets are respected.
