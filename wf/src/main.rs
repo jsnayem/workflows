@@ -252,13 +252,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Tab::Secrets => 1,
         Tab::Hindsight => 2,
     };
+    // Tabs renders its labels on a single line. No bordered Block wrapper:
+    // a bordered Block would consume the row and clip the labels.
     let tabs = Tabs::new(titles)
         .select(tab_idx)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("wf v{VERSION}")),
-        )
         .style(Style::default().fg(Color::Cyan));
     f.render_widget(tabs, chunks[0]);
 
@@ -268,7 +265,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Tab::Hindsight => draw_hindsight(f, app, chunks[1]),
     }
 
-    let footer = format!("{}\n{}", app.status, HELP);
+    let footer = format!("wf v{VERSION}  |  {}\n{}", app.status, HELP);
     let status = Paragraph::new(footer).block(Block::default().borders(Borders::ALL));
     f.render_widget(status, chunks[2]);
 }
@@ -451,3 +448,56 @@ fn headless_hindsight() -> io::Result<()> {
     println!("observations_mission: {}", hi.observations_mission);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn sample_app() -> App {
+        App {
+            tab: Tab::Projects,
+            repos: vec![],
+            selected: 0,
+            check: Arc::new(Mutex::new(CheckState::default())),
+            secrets: vec![],
+            hindsight: hindsight::BankInfo::default(),
+            sweep_status: String::new(),
+            confirm_sweep: false,
+            status: String::new(),
+        }
+    }
+
+    /// Render the TUI to an in-memory backend and confirm the tab labels
+    /// actually appear in the buffer (catches the "tabs clipped" layout bug).
+    #[test]
+    fn tab_bar_renders_labels() {
+        let app = sample_app();
+        let backend = TestBackend::new(100, 24);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| draw(f, &app)).expect("draw");
+
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains("[1] Projects"),
+            "Projects tab label missing from render:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("[2] Secrets"),
+            "Secrets tab label missing from render:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("[3] Hindsight"),
+            "Hindsight tab label missing from render:\n{rendered}"
+        );
+    }
+}
+
