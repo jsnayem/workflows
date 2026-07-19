@@ -125,7 +125,7 @@ const BACKUP_SH: &str = "/home/nayem/Projects/workflows/backup.sh";
 const BACKUP_DIR: &str = "/home/nayem/Projects/Backups";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str =
-    "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | R rebuild+restart | q quit | t theme  v verbose | Hindsight: Enter start / S stop";
+    "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | R rebuild+restart | t theme  v verbose  ? help | Hindsight: Enter start / S stop";
 
 #[derive(Debug, Clone)]
 enum Tab {
@@ -161,6 +161,8 @@ struct App {
     // UI theme + verbosity (loaded from XDG config, live-toggleable)
     theme: theme::Theme,
     verbose: bool,
+    // help overlay toggle
+    show_help: bool,
 }
 
 /// Snapshot of everything the panels render, recomputed by the background
@@ -271,6 +273,7 @@ fn main() -> io::Result<()> {
         last_scan: init.stamp,
         theme: cfg.theme,
         verbose: cfg.verbose,
+        show_help: false,
     };
 
     loop {
@@ -327,6 +330,10 @@ fn main() -> io::Result<()> {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') => break,
+                    // Toggle the keyboard-shortcuts help overlay.
+                    KeyCode::Char('?') | KeyCode::F(1) => {
+                        app.show_help = !app.show_help;
+                    }
                     KeyCode::Char('1') => {
                         app.tab = Tab::Projects;
                         app.confirm_sweep = false;
@@ -641,17 +648,50 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         app.theme.muted()
     };
     let footer = format!(
-        "wf v{VERSION} (theme: {})  |  autoscan {}\n{}",
+        "wf v{VERSION} (theme: {})  |  autoscan {}\n{}   |  ? help",
         app.theme.name, app.last_scan, app.status
     );
-    let status = Paragraph::new(footer)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(app.theme.border()),
-        )
-        .style(footer_style);
+    let status = Paragraph::new(footer).style(footer_style);
     f.render_widget(status, chunks[2]);
+
+    // Help overlay (toggled with ? / F1).
+    if app.show_help {
+        let help = vec![
+            "Keyboard shortcuts",
+            "",
+            "  1 2 3 4 / ← →   switch tabs (Projects/Secrets/Hindsight/Backup)",
+            "  ↑ ↓             move selection",
+            "  Enter           context action (make check / start+stop hindsight / backup)",
+            "  r               refresh now",
+            "  R               rebuild + restart (debug builds only)",
+            "  t               cycle color theme (dark/nord/high-contrast/mono)",
+            "  v               toggle verbose (plain-English captions)",
+            "  S then Y        stop hindsight-api",
+            "  Enter then Y    apply stale-memory sweep (invalidates stale facts)",
+            "  ? / F1          toggle this help",
+            "  q               quit",
+        ];
+        let lines: Vec<Line> = help
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                if i == 0 {
+                    Line::from(Span::styled(*s, app.theme.heading()))
+                } else {
+                    Line::from(Span::styled(*s, app.theme.value()))
+                }
+            })
+            .collect();
+        let popup = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(app.theme.accent())
+                    .title(Span::styled(" Help ", app.theme.heading())),
+            )
+            .style(app.theme.value());
+        f.render_widget(popup, centered_rect(70, 70, size));
+    }
 }
 
 fn draw_projects(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
@@ -1186,6 +1226,7 @@ mod tests {
             last_scan: String::new(),
             theme: theme::DARK,
             verbose: false,
+            show_help: false,
         }
     }
 
@@ -1232,6 +1273,38 @@ mod tests {
         assert!(
             rendered.contains("Graph links:"),
             "bank statistics missing from render:\n{rendered}"
+        );
+    }
+
+    /// The `?` / `F1` help overlay renders when `show_help` is set.
+    #[test]
+    fn help_overlay_renders() {
+        let mut app = sample_app();
+        app.tab = Tab::Hindsight;
+        app.show_help = true;
+        let backend = TestBackend::new(100, 40);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|f| draw(f, &app)).expect("draw");
+
+        let rendered: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            rendered.contains("Keyboard shortcuts"),
+            "help overlay title missing:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cycle color theme"),
+            "theme shortcut missing from help:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("toggle this help"),
+            "help toggle entry missing:\n{rendered}"
         );
     }
 }
