@@ -72,13 +72,20 @@ Implementation notes:
    hindsight `.env` (one-line config, local-only). Left OFF by default; the TUI
    renders it if present.
 
-## TIER B — local embedder & reranker visibility (NO hindsight-repo changes)
+## TIER B — local embedder & reranker visibility (IMPLEMENTED 2026-07-19; NO hindsight-repo changes)
 Constraint (user directive 2026-07-19): **do not modify the hindsight project.**
 So we cannot add counters to `metrics.py` / `embeddings.py` / `cross_encoder.py`.
-Instead, recover this data by parsing the log that the service already writes to
+Instead, we recover this data by parsing the log that the service already writes to
 `/tmp/hindsight-api.log` (the path `wf` itself uses when it starts the service,
 see `API_LOG` in `wf/src/hindsight.rs`). This is a pure-`wf` workaround: `wf`
-tails/parses its own log file and extracts counters, showing per-scan deltas.
+parses the log file and extracts counters, showing per-scan deltas.
+
+Status: shipped. `hindsight::parse_activity_log()` + `ActivityCounters` in
+`wf/src/hindsight.rs`; rendered as the "Local models (from log)" block in
+`draw_hindsight`. Verified against the live log (counts match raw grep exactly:
+7 rerank calls / 1975 candidates, 400 retain units, 7 query embeds, 222
+consolidation embed calls). Unit tests: `activity_log_parser_extracts_local_model_counts`,
+`activity_log_missing_file_is_not_readable`.
 
 ### Why this works (verified against the live log)
 The reranker and embedder run locally (ONNX embedder `BAAI/bge-small-en-v1.5`,

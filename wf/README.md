@@ -75,7 +75,12 @@ wf --secrets     # repo | file | reason   (stderr: total count)
   (retain / consolidation / verification), operation counts (retain / recall /
   reflect / consolidation, with deltas), and process stats (RSS MB, CPU seconds,
   open FDs, DB pool size). The graph/doc/by-type memory counts come from
-  `GET /v1/default/banks/hermes/stats`. When the service is down you can
+  `GET /v1/default/banks/hermes/stats`. It also shows a **Local models (from log)**
+  block for the embedder + reranker, which run locally and emit no `/metrics`
+  counters: `wf` parses the API log (`/tmp/hindsight-api.log`, override with
+  `HINDSIGHT_API_LOG`) to recover reranker calls/candidates/latency and embedder
+  retain-units / query-embeds / consolidation-calls (with per-scan deltas). When
+  the service is down you can
   start it from the TUI (`Enter`); when up you can stop it (`S` → `Y`) or apply
   (Enter) the sweep, which PATCH-invalidates stale world/experience memories
   using the correction-aware logic (it never deletes observations — those
