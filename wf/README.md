@@ -58,6 +58,27 @@ wf --list        # repo | branch | ↑ahead/↓behind | clean/dirty | make?
 wf --secrets     # repo | file | reason   (stderr: total count)
 ```
 
+## Keyboard shortcuts (TUI)
+- `1`/`2`/`3`/`4` or `←`/`→` — switch tabs (Projects / Secrets / Hindsight / Backup)
+- `↑`/`↓` — move selection
+- `Enter` — context action (run `make check`, start/stop hindsight, run backup)
+- `r` — refresh now · `R` — rebuild + restart (debug only)
+- `t` — **cycle color theme** (dark → nord → high-contrast → mono)
+- `v` — **toggle verbose** (plain-English captions for technical headings)
+- `S` then `Y` — stop hindsight-api · `Enter` then `Y` — apply stale-memory sweep
+- `q` — quit
+
+## Themes & verbosity
+`wf` colors every panel from a semantic *theme* (roles like `heading`, `good`,
+`warn`, `bad`, `accent` — never raw colors in draw code), so the four tabs stay
+visually consistent and you can swap palettes live. Four built-ins:
+`dark` (default), `nord`, `high-contrast`, `mono`. Press **`t`** to cycle; the
+choice is saved to `~/.config/wf/config.toml` (falls back to `~/.wf.toml`) and
+survives restarts. **`v`** toggles verbose mode — when on, each section gets a
+muted one-line plain-English caption (e.g. "Stale candidates" explains the
+dry-run preview; "Local models" explains that the embedder/reranker run on your
+machine). Both settings are persisted on toggle.
+
 ## What it does
 - **Projects**: recursively discovers git repos under `~/Projects` (stops at the
   first `.git`, so it never descends into a repo's internals / `target`), and
