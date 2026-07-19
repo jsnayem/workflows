@@ -72,27 +72,66 @@ Implementation notes:
    hindsight `.env` (one-line config, local-only). Left OFF by default; the TUI
    renders it if present.
 
-## TIER B — needs hindsight-repo backend work (DEFERRED / future)
-Embeddings and reranker are NOT instrumented:
-- `engine/embeddings.py` (ONNX provider, BAAI/bge-small) — emits no metrics.
-- `engine/cross_encoder.py` (local reranker, ms-marco-MiniLM) — emits no metrics.
+## TIER B — local embedder & reranker visibility (NO hindsight-repo changes)
+Constraint (user directive 2026-07-19): **do not modify the hindsight project.**
+So we cannot add counters to `metrics.py` / `embeddings.py` / `cross_encoder.py`.
+Instead, recover this data by parsing the log that the service already writes to
+`/tmp/hindsight-api.log` (the path `wf` itself uses when it starts the service,
+see `API_LOG` in `wf/src/hindsight.rs`). This is a pure-`wf` workaround: `wf`
+tails/parses its own log file and extracts counters, showing per-scan deltas.
 
-To surface them the hindsight repo needs (local-only, not committed into `wf`):
-1. Add counters in `metrics.py`:
-   - `hindsight.embeddings.calls.total` (labels: provider, model)
-   - `hindsight.embeddings.tokens.total` (or units embedded)
-   - `hindsight.reranker.calls.total` (labels: provider, model)
-   - `hindsight.reranker.candidates.total` (candidates scored)
-2. Emit them from the embedding/reranker call sites (wrap the inference).
-3. Then the TUI reads them from `/metrics` exactly like TIER A stats.
+### Why this works (verified against the live log)
+The reranker and embedder run locally (ONNX embedder `BAAI/bge-small-en-v1.5`,
+local cross-encoder `ms-marco-MiniML-L-6-v2`) and emit NO `/metrics` counters —
+but the recall/retain/consolidation paths DO log structured, parseable lines:
 
-Why deferred: crosses into the external hindsight service repo, which per the
-established scope boundary is a separate local-only service — its hygiene/metrics
-belong there, not folded into `wf`. Revisit when embedding/reranker cost visibility
-becomes a real need (e.g. token-budget tuning).
+| Stat | Log line (regex-able) | Derived |
+|------|----------------------|----------|
+| Reranker calls | `  [4] Reranking [cross-encoder]: {N} candidates scored in {X}s` | calls, candidates, latency |
+| Embed units (retain) | `STREAMING RETAIN COMPLETE: {U} units` / `DELTA RETAIN COMPLETE: {U} new units` | units embedded |
+| Embed query (recall) | `  [1] Generate query embedding: {X}s` | query-embed calls + latency |
+| Embed calls (consolidation) | `Timing breakdown: ... embedding={T}s ({C} calls, avg={A}ms)` | embed calls + time |
+| Recall demand | `[RECALL ...] Complete: {F} facts (...)` | facts returned (proxy demand) |
+
+So a `wf`-side parser can reconstruct:
+- **Reranker**: total calls, total candidates scored, last/total latency.
+- **Embedder**: total units embedded (from retain completions), total query
+  embeds (from recall lines), total embed calls during consolidation, and
+  aggregate embed latency. (Token counts are meaningless for a fixed-dim local
+  ONNX model, so "units embedded" is the correct unit — consistent with the
+  user's note that the embedder/reranker are local.)
+
+### Implementation approach (all in `wf`, no hindsight touch)
+1. In `wf/src/hindsight.rs` add `parse_activity_log(path) -> ActivityCounters`
+   that reads `/tmp/hindsight-api.log` (last N KB is enough; the file is small
+   and rotated/truncated on restart) and regex-counts the lines above.
+2. Keep a previous-sample in `App` (like `prev_hindsight`) to show per-scan
+   deltas, exactly like TIER A's LLM deltas.
+3. When the service is started by `wf`, the log already goes to `API_LOG`. When
+   the user starts it manually in a terminal, the log is wherever they put it —
+   so make the path configurable (env `HINDSIGHT_API_LOG` defaulting to
+   `/tmp/hindsight-api.log`), and show "log: n/a" if unreadable.
+4. Render a "Local models (from log)" sub-block in the Hindsight panel:
+   reranker calls/candidates/latency + embedder units/query-embeds/calls.
+
+### Caveats (honest)
+- Log-format coupled: if upstream changes the log strings, the parser needs a
+  tweak. Mitigation: anchor on stable tokens (`Reranking [cross-encoder]:`,
+  `RETAIN COMPLETE:`, `Generate query embedding:`).
+- Only meaningful while the log is retained. A restart truncates counters to 0
+  (handled by the delta saturating at 0, same as TIER A metrics reset).
+- Reranker lines only appear on recall with `reranking=cross_encoder` (not on
+  rrf/interleave passthrough) — that's correct, those paths don't run the model.
+- This recovers ACTIVITY, not model-internal state. That is exactly what the old
+  stdout log gave you, now rendered in the TUI.
+
+This is strictly better than editing the hindsight repo: zero risk to the
+service, zero scope breach, and it covers both embedder and reranker using data
+that already exists.
 
 ## Verification
 - `cargo test` regression guard `hindsight_panel_renders_status` covers the panel.
 - Manual: run `wf`, tab 3, confirm Live Metrics block populates while the API is
   up and clears to "n/a (service down)" when stopped.
 - Source of truth for available metrics: `curl -s localhost:8888/metrics`.
+- Source of truth for local-model activity: `tail -f /tmp/hindsight-api.log`.
