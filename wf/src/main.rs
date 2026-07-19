@@ -5,12 +5,14 @@
 mod git;
 mod hindsight;
 mod secrets;
+mod theme;
 
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::Style,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table, Tabs},
     Terminal,
 };
@@ -123,7 +125,7 @@ const BACKUP_SH: &str = "/home/nayem/Projects/workflows/backup.sh";
 const BACKUP_DIR: &str = "/home/nayem/Projects/Backups";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str =
-    "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | R rebuild+restart | q quit | Hindsight: Enter start / S stop";
+    "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | R rebuild+restart | q quit | t theme  v verbose | Hindsight: Enter start / S stop";
 
 #[derive(Debug, Clone)]
 enum Tab {
@@ -156,6 +158,9 @@ struct App {
     prev_hindsight: hindsight::BankInfo,
     // wall-clock of the last live rescan (shown in the footer so you can see it tick)
     last_scan: String,
+    // UI theme + verbosity (loaded from XDG config, live-toggleable)
+    theme: theme::Theme,
+    verbose: bool,
 }
 
 /// Snapshot of everything the panels render, recomputed by the background
@@ -246,6 +251,7 @@ fn main() -> io::Result<()> {
     }
 
     let init = shared_scan.lock().unwrap().clone();
+    let cfg = theme::Config::load();
     let mut app = App {
         tab: Tab::Projects,
         repos: init.repos,
@@ -263,6 +269,8 @@ fn main() -> io::Result<()> {
         hindsight_status: Arc::new(Mutex::new(String::new())),
         prev_hindsight: hindsight::BankInfo::default(),
         last_scan: init.stamp,
+        theme: cfg.theme,
+        verbose: cfg.verbose,
     };
 
     loop {
@@ -360,6 +368,26 @@ fn main() -> io::Result<()> {
                         }
                     }
                     KeyCode::Char('r') => refresh(&mut app, &root),
+                    // Cycle the color theme and persist it.
+                    KeyCode::Char('t') => {
+                        app.theme = app.theme.next();
+                        let cfg = theme::Config {
+                            theme: app.theme,
+                            verbose: app.verbose,
+                        };
+                        cfg.save();
+                        app.status = format!("theme: {}", app.theme.name);
+                    }
+                    // Toggle verbose (explain technical headings) and persist it.
+                    KeyCode::Char('v') => {
+                        app.verbose = !app.verbose;
+                        let cfg = theme::Config {
+                            theme: app.theme,
+                            verbose: app.verbose,
+                        };
+                        cfg.save();
+                        app.status = format!("verbose: {}", if app.verbose { "on" } else { "off" });
+                    }
                     // Dev: hard restart — rebuild now and re-exec the fresh binary.
                     #[cfg(all(unix, debug_assertions))]
                     KeyCode::Char('R') => {
@@ -590,7 +618,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // a bordered Block would consume the row and clip the labels.
     let tabs = Tabs::new(titles)
         .select(tab_idx)
-        .style(Style::default().fg(Color::Cyan));
+        .style(if tab_idx == 0 {
+            app.theme.accent()
+        } else {
+            app.theme.muted()
+        })
+        .highlight_style(app.theme.selected());
     f.render_widget(tabs, chunks[0]);
 
     match app.tab {
@@ -600,11 +633,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Tab::Backup => draw_backup(f, app, chunks[1]),
     }
 
+    let footer_style = if app.status.contains("RUNNING") || app.status.contains("stopped") {
+        app.theme.bad()
+    } else if app.status.contains("failed") || app.status.contains("error") {
+        app.theme.bad()
+    } else {
+        app.theme.muted()
+    };
     let footer = format!(
-        "wf v{VERSION}  |  autoscan {}\n{}",
-        app.last_scan, app.status
+        "wf v{VERSION} (theme: {})  |  autoscan {}\n{}",
+        app.theme.name, app.last_scan, app.status
     );
-    let status = Paragraph::new(footer).block(Block::default().borders(Borders::ALL));
+    let status = Paragraph::new(footer)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(app.theme.border()),
+        )
+        .style(footer_style);
     f.render_widget(status, chunks[2]);
 }
 
@@ -617,17 +663,31 @@ fn draw_projects(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
             let flag = if r.dirty { "●" } else { " " };
             let ab = format!("↑{}↓{}", r.ahead, r.behind);
             let style = if i == app.selected {
-                Style::default().add_modifier(Modifier::REVERSED)
+                app.theme.selected()
             } else {
                 Style::default()
             };
+            // color the dirty flag + ahead/behind as caution
+            let flag_style = if r.dirty {
+                app.theme.warn()
+            } else {
+                app.theme.good()
+            };
+            let ab_style = if r.ahead > 0 || r.behind > 0 {
+                app.theme.warn()
+            } else {
+                app.theme.muted()
+            };
             Row::new(vec![
-                flag.to_string(),
-                r.name.clone(),
-                r.branch.clone(),
-                ab,
-                r.last_commit.clone(),
-                if r.has_makefile { "make" } else { "-" }.to_string(),
+                Span::styled(flag.to_string(), flag_style),
+                Span::styled(r.name.clone(), app.theme.value()),
+                Span::styled(r.branch.clone(), app.theme.muted()),
+                Span::styled(ab, ab_style),
+                Span::styled(r.last_commit.clone(), app.theme.muted()),
+                Span::styled(
+                    if r.has_makefile { "make" } else { "-" }.to_string(),
+                    app.theme.label(),
+                ),
             ])
             .style(style)
         })
@@ -642,19 +702,27 @@ fn draw_projects(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
     ];
     let table = Table::new(rows, widths)
         .header(Row::new(vec![
-            "",
-            "repo",
-            "branch",
-            "a/b",
-            "last commit",
-            "chk",
+            Span::styled("", app.theme.label()),
+            Span::styled("repo", app.theme.label()),
+            Span::styled("branch", app.theme.label()),
+            Span::styled("a/b", app.theme.label()),
+            Span::styled("last commit", app.theme.label()),
+            Span::styled("chk", app.theme.label()),
         ]))
-        .block(Block::default().borders(Borders::ALL).title(format!(
-            "Projects ({})  ●dirty:{}  ↓behind:{}  Enter: make check",
-            app.repos.len(),
-            app.repos.iter().filter(|r| r.dirty).count(),
-            app.repos.iter().filter(|r| r.behind > 0).count()
-        )));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(app.theme.border())
+                .title(Span::styled(
+                    format!(
+                        "Projects ({})  ●dirty:{}  ↓behind:{}  Enter: make check",
+                        app.repos.len(),
+                        app.repos.iter().filter(|r| r.dirty).count(),
+                        app.repos.iter().filter(|r| r.behind > 0).count()
+                    ),
+                    app.theme.heading(),
+                )),
+        );
     f.render_widget(table, area);
 
     let st = app.check.lock().unwrap();
@@ -668,7 +736,13 @@ fn draw_projects(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect)
             },
             st.output
         ))
-        .block(Block::default().borders(Borders::ALL).title("Check"));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(app.theme.border())
+                .title(Span::styled("Check", app.theme.heading())),
+        )
+        .style(app.theme.value());
         let pop = centered_rect(60, 60, area);
         f.render_widget(popup, pop);
     }
@@ -680,14 +754,24 @@ fn draw_secrets(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) 
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let style = if i == app.selected {
-                Style::default()
-                    .add_modifier(Modifier::REVERSED)
-                    .fg(Color::Red)
+            // Tracked secrets are the real risk (bright red); untracked = caution.
+            let tracked = s.reason.contains("tracked");
+            let base = if tracked {
+                app.theme.bad()
             } else {
-                Style::default().fg(Color::Red)
+                app.theme.warn()
             };
-            Row::new(vec![s.repo.clone(), s.file.clone(), s.reason.clone()]).style(style)
+            let style = if i == app.selected {
+                app.theme.selected()
+            } else {
+                base
+            };
+            Row::new(vec![
+                Span::styled(s.repo.clone(), app.theme.label()),
+                Span::styled(s.file.clone(), app.theme.value()),
+                Span::styled(s.reason.clone(), base),
+            ])
+            .style(style)
         })
         .collect();
     let table = Table::new(
@@ -698,117 +782,263 @@ fn draw_secrets(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) 
             Constraint::Min(20),
         ],
     )
-    .header(Row::new(vec!["repo", "file", "reason"]))
+    .header(Row::new(vec![
+        Span::styled("repo", app.theme.label()),
+        Span::styled("file", app.theme.label()),
+        Span::styled("reason", app.theme.label()),
+    ]))
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!("Secrets ({})", app.secrets.len())),
+            .border_style(app.theme.border())
+            .title(Span::styled(
+                format!("Secrets ({})", app.secrets.len()),
+                app.theme.heading(),
+            )),
     );
     f.render_widget(table, area);
 }
 
 fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let th = app.theme;
     let hi = &app.hindsight;
+    let v = app.verbose;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // in verbose mode, append a muted one-line plain-English caption
+    let push_cap = |lines: &mut Vec<Line>, s: &str| {
+        if v {
+            lines.push(Line::from(Span::styled(s.to_string(), th.muted())));
+        }
+    };
+
+    // --- status ---
     let state_line = if hi.running {
-        format!("● RUNNING  (v{})", hi.version)
+        Span::styled(format!("● RUNNING  (v{})", hi.version), th.good())
     } else {
-        "○ STOPPED".to_string()
+        Span::styled("○ STOPPED", th.bad())
     };
-    // One control per line, so they don't run together or overflow.
-    let controls = if hi.running {
-        "Enter: run stale-memory sweep\nS: stop service".to_string()
-    } else {
-        "Enter: START hindsight-api\n(needs the local service up for memory ops)".to_string()
-    };
-    let stats = if hi.running {
-        format!(
-            "Total memories: {}\nGraph links: {}\nDocuments: {}\nBy type: world={} experience={} observation={}\nStale candidates (dry-run): {}",
-            hi.total_memories,
-            hi.total_links,
-            hi.total_documents,
-            hi.fact_world,
-            hi.fact_experience,
-            hi.fact_observation,
-            hi.stale_candidates,
-        )
-    } else {
-        "Total memories: -\nStale candidates (dry-run): -".to_string()
-    };
-    let bottom = if app.confirm_stop {
-        "CONFIRM STOP: press Y to STOP hindsight-api.\nAny other key cancels.".to_string()
-    } else if app.confirm_sweep {
-        "WARNING: press Y to APPLY sweep (invalidates stale\nworld/experience memories). Any other key cancels.".to_string()
-    } else {
-        controls
-    };
-    // Live runtime metrics from /metrics (Tier A). Show cumulative total plus a
-    // per-scan delta (rate) so you see *activity* since the last rescan.
-    let metrics = if hi.running {
-        let p = &app.prev_hindsight;
-        let dd = |cur: u64, prev: u64| format!(" (+{} /scan)", d64(cur, prev));
-        format!(
-            "LLM calls: {}{}\n  in tokens: {}{}  out tokens: {}{}\n  by scope: retain={} consol={} verify={}\nOps: retain={}{} recall={}{} reflect={}{} consol={}{}\nProcess: rss={} MB  cpu={:.0}s  fds={}  dbpool={}",
-            hi.llm_calls,
-            dd(hi.llm_calls, p.llm_calls),
-            hi.llm_in_tokens,
-            dd(hi.llm_in_tokens, p.llm_in_tokens),
-            hi.llm_out_tokens,
-            dd(hi.llm_out_tokens, p.llm_out_tokens),
-            hi.llm_calls_retain,
-            hi.llm_calls_consolidation,
-            hi.llm_calls_verification,
-            hi.op_retain,
-            dd(hi.op_retain, p.op_retain),
-            hi.op_recall,
-            dd(hi.op_recall, p.op_recall),
-            hi.op_reflect,
-            dd(hi.op_reflect, p.op_reflect),
-            hi.op_consolidation,
-            dd(hi.op_consolidation, p.op_consolidation),
-            hi.proc_rss_mb,
-            hi.proc_cpu_secs,
-            hi.proc_open_fds,
-            hi.db_pool_size,
-        )
-    } else {
-        "LLM/process metrics: n/a (service down)".to_string()
-    };
-    // Local models (embedder + reranker) recovered from the API log — these run
-    // locally and emit no /metrics counters (see HINDSIGHT_METRICS_PROPOSAL.md).
-    let local = if !hi.running {
-        "Local models: n/a (service down)".to_string()
-    } else if !hi.log_readable {
-        "Local models: log n/a (set HINDSIGHT_API_LOG if started outside wf)".to_string()
-    } else {
-        let p = &app.prev_hindsight;
-        let dd = |cur: u64, prev: u64| format!(" (+{} /scan)", d64(cur, prev));
-        format!(
-            "Reranker: {} calls{}  {} candidates{}  last {:.1}s\nEmbedder: {} retain units{}  {} query embeds{}  {} consol calls",
-            hi.rerank_calls,
-            dd(hi.rerank_calls, p.rerank_calls),
-            hi.rerank_candidates,
-            dd(hi.rerank_candidates, p.rerank_candidates),
-            hi.rerank_last_secs,
-            hi.embed_retain_units,
-            dd(hi.embed_retain_units, p.embed_retain_units),
-            hi.embed_query_calls,
-            dd(hi.embed_query_calls, p.embed_query_calls),
-            hi.embed_consolidation_calls,
-        )
-    };
-    let text = format!(
-        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\n{stats}\n\nLive metrics (from /metrics):\n{metrics}\n\nLocal models (from log):\n{local}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}",
-        hindsight::API_URL,
-        wrap(&hi.observations_mission, 72),
-        if !app.service_msg.is_empty() {
-            format!("Service: {}", app.service_msg)
-        } else {
-            String::new()
-        },
-        app.sweep_status,
-        bottom,
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", th.label()),
+        state_line,
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("URL: ", th.label()),
+        Span::styled(format!("{}/health", hindsight::API_URL), th.value()),
+    ]));
+    push_cap(
+        &mut lines,
+        "The local hindsight-api is a process; this shows whether it answers health checks.",
     );
-    let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Hindsight"));
+    lines.push(Line::from(""));
+
+    // --- bank stats (from /stats) ---
+    lines.push(Line::from(Span::styled(
+        "Bank hermes @ localhost:8888",
+        th.heading(),
+    )));
+    let stat = |label: &str, val: String| {
+        Line::from(vec![
+            Span::styled(format!("{label}: "), th.label()),
+            Span::styled(val, th.value()),
+        ])
+    };
+    if hi.running {
+        lines.push(stat("Total memories", hi.total_memories.to_string()));
+        lines.push(stat("Graph links", hi.total_links.to_string()));
+        lines.push(stat("Documents", hi.total_documents.to_string()));
+        lines.push(stat(
+            "By type",
+            format!(
+                "world={} experience={} observation={}",
+                hi.fact_world, hi.fact_experience, hi.fact_observation
+            ),
+        ));
+    } else {
+        lines.push(stat("Total memories", "-".into()));
+    }
+    push_cap(
+        &mut lines,
+        "Counts of stored memory units + the relationship graph the engine retrieves over.",
+    );
+    lines.push(Line::from(""));
+
+    // --- stale candidates (dry-run preview) ---
+    lines.push(Line::from(vec![
+        Span::styled("Stale candidates: ", th.label()),
+        Span::styled(hi.stale_candidates.to_string(), th.warn()),
+    ]));
+    push_cap(&mut lines, "Memories matching stale-wrong patterns with no correction signal. This is a DRY-RUN preview of the sweep — nothing has changed. Press Enter then Y to actually invalidate them.");
+
+    // --- live metrics (from /metrics) ---
+    lines.push(Line::from(Span::styled(
+        "Live metrics (from /metrics):",
+        th.heading(),
+    )));
+    push_cap(&mut lines, "Cloud LLM + operation counters, scraped read-only from the service's Prometheus endpoint. Per-scan deltas show activity since the last refresh.");
+    if hi.running {
+        let p = &app.prev_hindsight;
+        let dd = |cur: u64, prev: u64| {
+            if cur > prev {
+                format!(" (+{} /scan)", cur - prev)
+            } else {
+                String::new()
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  LLM calls: ", th.label()),
+            Span::styled(hi.llm_calls.to_string(), th.value()),
+            Span::styled(dd(hi.llm_calls, p.llm_calls), th.muted()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  in/out tokens: ", th.label()),
+            Span::styled(hi.llm_in_tokens.to_string(), th.value()),
+            Span::styled("/", th.muted()),
+            Span::styled(hi.llm_out_tokens.to_string(), th.value()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  by scope: ", th.label()),
+            Span::styled(
+                format!(
+                    "retain={} consol={} verify={}",
+                    hi.llm_calls_retain, hi.llm_calls_consolidation, hi.llm_calls_verification
+                ),
+                th.value(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Ops: ", th.label()),
+            Span::styled(
+                format!(
+                    "retain={}{} recall={}{} reflect={}{} consol={}{}",
+                    hi.op_retain,
+                    dd(hi.op_retain, p.op_retain),
+                    hi.op_recall,
+                    dd(hi.op_recall, p.op_recall),
+                    hi.op_reflect,
+                    dd(hi.op_reflect, p.op_reflect),
+                    hi.op_consolidation,
+                    dd(hi.op_consolidation, p.op_consolidation),
+                ),
+                th.value(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Process: ", th.label()),
+            Span::styled(
+                format!(
+                    "rss={} MB cpu={:.0}s fds={} dbpool={}",
+                    hi.proc_rss_mb, hi.proc_cpu_secs, hi.proc_open_fds, hi.db_pool_size
+                ),
+                th.value(),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  LLM/process metrics: n/a (service down)",
+            th.muted(),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    // --- local models (from log) ---
+    lines.push(Line::from(Span::styled(
+        "Local models (from log):",
+        th.heading(),
+    )));
+    push_cap(&mut lines, "The embedder + reranker run ON your machine (not the cloud) and emit no /metrics. wf recovers their activity from the service log instead.");
+    if !hi.running {
+        lines.push(Line::from(Span::styled("  n/a (service down)", th.muted())));
+    } else if !hi.log_readable {
+        lines.push(Line::from(Span::styled(
+            "  log n/a (set HINDSIGHT_API_LOG if started outside wf)",
+            th.muted(),
+        )));
+    } else {
+        let p = &app.prev_hindsight;
+        let dd = |cur: u64, prev: u64| {
+            if cur > prev {
+                format!(" (+{} /scan)", cur - prev)
+            } else {
+                String::new()
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Reranker: ", th.label()),
+            Span::styled(format!("{} calls", hi.rerank_calls), th.value()),
+            Span::styled(dd(hi.rerank_calls, p.rerank_calls), th.muted()),
+            Span::styled(format!(" {} candidates", hi.rerank_candidates), th.value()),
+            Span::styled(format!(" last {:.1}s", hi.rerank_last_secs), th.muted()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Embedder: ", th.label()),
+            Span::styled(
+                format!("{} retain units", hi.embed_retain_units),
+                th.value(),
+            ),
+            Span::styled(dd(hi.embed_retain_units, p.embed_retain_units), th.muted()),
+            Span::styled(
+                format!(" {} query embeds", hi.embed_query_calls),
+                th.value(),
+            ),
+            Span::styled(dd(hi.embed_query_calls, p.embed_query_calls), th.muted()),
+            Span::styled(
+                format!(" {} consol calls", hi.embed_consolidation_calls),
+                th.value(),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // --- observations mission ---
+    lines.push(Line::from(Span::styled(
+        "Observations mission:",
+        th.heading(),
+    )));
+    for w in wrap(&hi.observations_mission, 72).split('\n') {
+        lines.push(Line::from(Span::styled(w.to_string(), th.muted())));
+    }
+    lines.push(Line::from(""));
+
+    // --- service msg / sweep status / controls ---
+    if !app.service_msg.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Service: {}", app.service_msg),
+            th.accent(),
+        )));
+    }
+    if !app.sweep_status.is_empty() {
+        lines.push(Line::from(Span::styled(
+            app.sweep_status.clone(),
+            th.good(),
+        )));
+    }
+    let bottom = if app.confirm_stop {
+        "CONFIRM STOP: press Y to STOP hindsight-api.\nAny other key cancels."
+    } else if app.confirm_sweep {
+        "WARNING: press Y to APPLY sweep (invalidates stale\nworld/experience memories). Any other key cancels."
+    } else if hi.running {
+        "Enter: run stale-memory sweep\nS: stop service"
+    } else {
+        "Enter: START hindsight-api\n(needs the local service up for memory ops)"
+    };
+    for bl in bottom.split('\n') {
+        lines.push(Line::from(Span::styled(
+            bl.to_string(),
+            if app.confirm_stop {
+                th.bad()
+            } else {
+                th.label()
+            },
+        )));
+    }
+
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(th.border())
+            .title(Span::styled("Hindsight", th.heading())),
+    );
     f.render_widget(p, area);
 }
 
@@ -835,14 +1065,8 @@ fn wrap(text: &str, width: usize) -> String {
     out
 }
 
-/// Per-interval delta for a u64 counter (rate since the previous scan).
-/// Returns 0 when the previous sample is missing or larger (e.g. service
-/// restarted and counters reset).
-fn d64(cur: u64, prev: u64) -> u64 {
-    cur.saturating_sub(prev)
-}
-
 fn draw_backup(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let th = app.theme;
     let body = format!(
         "Backup SOP: {}\n\nRuns the existing backup.sh — rsync media + sqlite VACUUM dump\nfrom remote servers cs/ss -> {}.\n\nEnter: run backup (pulls remote -> local)\n\nLocal backups in {}:\n{}",
         BACKUP_SH,
@@ -850,11 +1074,17 @@ fn draw_backup(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
         BACKUP_DIR,
         app.backup_list,
     );
-    let p = Paragraph::new(body).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("[4] Backup  Enter: run backup.sh"),
-    );
+    let p = Paragraph::new(body)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(th.border())
+                .title(Span::styled(
+                    "[4] Backup  Enter: run backup.sh",
+                    th.heading(),
+                )),
+        )
+        .style(th.value());
     f.render_widget(p, area);
 
     let st = app.backup.lock().unwrap();
@@ -865,7 +1095,13 @@ fn draw_backup(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
             "backup.sh output:"
         };
         let popup = Paragraph::new(format!("{head}\n{}", st.output))
-            .block(Block::default().borders(Borders::ALL).title("Backup"));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(th.border())
+                    .title(Span::styled("Backup", th.heading())),
+            )
+            .style(th.value());
         f.render_widget(popup, centered_rect(70, 70, area));
     }
 }
@@ -948,6 +1184,8 @@ mod tests {
             hindsight_status: Arc::new(Mutex::new(String::new())),
             prev_hindsight: hindsight::BankInfo::default(),
             last_scan: String::new(),
+            theme: theme::DARK,
+            verbose: false,
         }
     }
 
