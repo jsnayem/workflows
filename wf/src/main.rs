@@ -152,6 +152,8 @@ struct App {
     // shared channel the start thread writes its outcome to (so the TUI
     // can pick it up on the next live-rescan tick)
     hindsight_status: Arc<Mutex<String>>,
+    // previous scan's BankInfo — used to compute per-interval deltas (rates)
+    prev_hindsight: hindsight::BankInfo,
     // wall-clock of the last live rescan (shown in the footer so you can see it tick)
     last_scan: String,
 }
@@ -259,6 +261,7 @@ fn main() -> io::Result<()> {
         status: HELP.into(),
         service_msg: String::new(),
         hindsight_status: Arc::new(Mutex::new(String::new())),
+        prev_hindsight: hindsight::BankInfo::default(),
         last_scan: init.stamp,
     };
 
@@ -277,6 +280,7 @@ fn main() -> io::Result<()> {
                     app.selected = app.repos.len().saturating_sub(1);
                 }
                 app.secrets = s.secrets.clone();
+                app.prev_hindsight = app.hindsight.clone();
                 app.hindsight = s.hindsight.clone();
                 app.backup_list = s.backup_list.clone();
                 app.last_scan = s.stamp.clone();
@@ -737,8 +741,40 @@ fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
     } else {
         controls
     };
+    // Live runtime metrics from /metrics (Tier A). Show cumulative total plus a
+    // per-scan delta (rate) so you see *activity* since the last rescan.
+    let metrics = if hi.running {
+        let p = &app.prev_hindsight;
+        let dd = |cur: u64, prev: u64| format!(" (+{} /scan)", d64(cur, prev));
+        format!(
+            "LLM calls: {}{}\n  in tokens: {}{}  out tokens: {}{}\n  by scope: retain={} consol={} verify={}\nOps: retain={}{} recall={}{} reflect={}{} consol={}{}\nProcess: rss={} MB  cpu={:.0}s  fds={}  dbpool={}",
+            hi.llm_calls,
+            dd(hi.llm_calls, p.llm_calls),
+            hi.llm_in_tokens,
+            dd(hi.llm_in_tokens, p.llm_in_tokens),
+            hi.llm_out_tokens,
+            dd(hi.llm_out_tokens, p.llm_out_tokens),
+            hi.llm_calls_retain,
+            hi.llm_calls_consolidation,
+            hi.llm_calls_verification,
+            hi.op_retain,
+            dd(hi.op_retain, p.op_retain),
+            hi.op_recall,
+            dd(hi.op_recall, p.op_recall),
+            hi.op_reflect,
+            dd(hi.op_reflect, p.op_reflect),
+            hi.op_consolidation,
+            dd(hi.op_consolidation, p.op_consolidation),
+            hi.proc_rss_mb,
+            hi.proc_cpu_secs,
+            hi.proc_open_fds,
+            hi.db_pool_size,
+        )
+    } else {
+        "LLM/process metrics: n/a (service down)".to_string()
+    };
     let text = format!(
-        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\n{stats}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}",
+        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\n{stats}\n\nLive metrics (from /metrics):\n{metrics}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}",
         hindsight::API_URL,
         wrap(&hi.observations_mission, 72),
         if !app.service_msg.is_empty() {
@@ -774,6 +810,13 @@ fn wrap(text: &str, width: usize) -> String {
         }
     }
     out
+}
+
+/// Per-interval delta for a u64 counter (rate since the previous scan).
+/// Returns 0 when the previous sample is missing or larger (e.g. service
+/// restarted and counters reset).
+fn d64(cur: u64, prev: u64) -> u64 {
+    cur.saturating_sub(prev)
 }
 
 fn draw_backup(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
@@ -880,6 +923,7 @@ mod tests {
             status: String::new(),
             service_msg: String::new(),
             hindsight_status: Arc::new(Mutex::new(String::new())),
+            prev_hindsight: hindsight::BankInfo::default(),
             last_scan: String::new(),
         }
     }

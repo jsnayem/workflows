@@ -32,6 +32,32 @@ pub struct BankInfo {
     pub fact_world: u64,
     pub fact_experience: u64,
     pub fact_observation: u64,
+    // --- live runtime metrics (from GET /metrics, Prometheus text) ---
+    /// Cumulative LLM API calls (all scopes).
+    pub llm_calls: u64,
+    /// Cumulative LLM input tokens (all scopes).
+    pub llm_in_tokens: u64,
+    /// Cumulative LLM output tokens (all scopes).
+    pub llm_out_tokens: u64,
+    /// LLM calls attributed to retain (retain_extract_facts scope).
+    pub llm_calls_retain: u64,
+    /// LLM calls attributed to consolidation (+ consolidation_dedup).
+    pub llm_calls_consolidation: u64,
+    /// LLM calls attributed to verification.
+    pub llm_calls_verification: u64,
+    /// Operation counts (retain/recall/reflect/consolidation).
+    pub op_retain: u64,
+    pub op_recall: u64,
+    pub op_reflect: u64,
+    pub op_consolidation: u64,
+    /// Process resident memory in MB.
+    pub proc_rss_mb: u64,
+    /// Process CPU seconds (cumulative).
+    pub proc_cpu_secs: f64,
+    /// Open file descriptors.
+    pub proc_open_fds: u64,
+    /// DB connection pool size.
+    pub db_pool_size: u64,
 }
 
 /// Run curl, return stdout text on HTTP success (else None).
@@ -65,6 +91,46 @@ pub fn api_version() -> Option<String> {
                 .map(|s| s.to_string())
         })
     })
+}
+
+/// Parse the OpenTelemetry/Prometheus text exposition format returned by
+/// `/metrics`. Returns a map of `metric_name{labels}` -> value for every
+/// sample line (counter/histogram-sum/histogram-count/gauge). Histogram
+/// bucket lines (`_bucket{le=...}`) are skipped — we only want the aggregate
+/// `_sum` / `_count` / gauge values. Comment (`#`) and empty lines are skipped.
+fn parse_prometheus(text: &str) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Sample: name{labels} value   or   name value
+        let (head, val) = match line.rsplit_once(' ') {
+            Some((h, v)) => (h, v),
+            None => continue,
+        };
+        let value: f64 = match val.trim().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Skip histogram bucket detail lines.
+        if head.contains("_bucket{") {
+            continue;
+        }
+        // Normalize: drop the trailing_le bucket label set for sum/count so
+        // `hindsight_llm_duration_seconds_count{...}` keeps its labels but
+        // `_bucket` is excluded above. Keep full key as-is for gauges/counters.
+        out.insert(head.to_string(), value);
+    }
+    out
+}
+
+/// Pull and parse the live `/metrics` endpoint into a convenient accessor.
+/// Returns None when the service is down (caller shows "n/a").
+pub fn metrics() -> Option<std::collections::HashMap<String, f64>> {
+    let t = curl_text(&format!("{BASE}/metrics"))?;
+    Some(parse_prometheus(&t))
 }
 
 /// Redirect a stdio to the API log file, or to /dev/null if it can't be opened.
@@ -193,6 +259,77 @@ pub fn info() -> BankInfo {
             info.fact_experience = ft.get("experience").and_then(|t| t.as_u64()).unwrap_or(0);
             info.fact_observation = ft.get("observation").and_then(|t| t.as_u64()).unwrap_or(0);
         }
+    }
+    // Live runtime metrics from the Prometheus /metrics endpoint.
+    if let Some(m) = metrics() {
+        // Sum counters across all label sets (e.g. all scopes/models), but
+        // skip histogram sub-series (_sum/_count/_bucket) of *other* metrics
+        // that share this prefix.
+        let sum_where = |prefix: &str| -> u64 {
+            m.iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .filter(|(k, _)| {
+                    // keep only the plain counter series, not histogram parts
+                    !k.contains("_bucket{") && !k.ends_with("_sum{") && !k.ends_with("_count{")
+                })
+                .map(|(_, v)| *v as u64)
+                .sum()
+        };
+        info.llm_calls = sum_where("hindsight_llm_calls_total{");
+        info.llm_in_tokens = sum_where("hindsight_llm_tokens_input_tokens_total{");
+        info.llm_out_tokens = sum_where("hindsight_llm_tokens_output_tokens_total{");
+        // Scope-specific LLM calls.
+        let sum_scope = |scope: &str| -> u64 {
+            m.iter()
+                .filter(|(k, _)| {
+                    k.starts_with("hindsight_llm_calls_total{")
+                        && k.contains(&format!("scope=\"{scope}\""))
+                })
+                .map(|(_, v)| *v as u64)
+                .sum()
+        };
+        info.llm_calls_retain = sum_scope("retain_extract_facts");
+        info.llm_calls_consolidation =
+            sum_scope("consolidation") + sum_scope("consolidation_dedup");
+        info.llm_calls_verification = sum_scope("verification");
+        // Operation counts by type.
+        let op_count = |op: &str| -> u64 {
+            m.iter()
+                .filter(|(k, _)| {
+                    k.starts_with("hindsight_operation_operations_total{")
+                        && k.contains(&format!("operation=\"{op}\""))
+                })
+                .map(|(_, v)| *v as u64)
+                .sum()
+        };
+        info.op_retain = op_count("retain");
+        info.op_recall = op_count("recall");
+        info.op_reflect = op_count("reflect");
+        info.op_consolidation = op_count("consolidation");
+        // Process + DB pool gauges (keys carry labels, so match by prefix).
+        let first_val = |prefix: &str| -> Option<f64> {
+            m.iter()
+                .find(|(k, _)| k.starts_with(prefix))
+                .map(|(_, v)| *v)
+        };
+        info.proc_rss_mb = first_val("hindsight_process_memory_bytes{")
+            .map(|v| (v as u64) / 1_048_576)
+            .unwrap_or(0);
+        info.proc_cpu_secs = first_val("hindsight_process_cpu_seconds{")
+            .map(|_| {
+                // sum user+system if both present
+                m.iter()
+                    .filter(|(k, _)| k.starts_with("hindsight_process_cpu_seconds{"))
+                    .map(|(_, v)| *v)
+                    .sum()
+            })
+            .unwrap_or(0.0);
+        info.proc_open_fds = first_val("hindsight_process_open_fds{")
+            .map(|v| v as u64)
+            .unwrap_or(0);
+        info.db_pool_size = first_val("hindsight_db_pool_size{")
+            .map(|v| v as u64)
+            .unwrap_or(0);
     }
     info.stale_candidates = dry_run_sweep_count();
     info

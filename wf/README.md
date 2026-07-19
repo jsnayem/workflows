@@ -69,9 +69,13 @@ wf --secrets     # repo | file | reason   (stderr: total count)
   long non-placeholder values). Read-only.
 - **Hindsight**: reads the local `hermes` bank at `localhost:8888`; shows a live
   **running/stopped** status (polls `/health` every ~2s), version, totals, and a
-  **dry-run** stale count, and a live statistics block (graph links, documents,
-  and memory-unit counts by type: world / experience / observation — all pulled
-  from `GET /v1/default/banks/hermes/stats`). When the service is down you can
+  **dry-run** stale count. It also renders a **Live metrics** block sourced from
+  the service's Prometheus `/metrics` endpoint (polled every ~2s): LLM calls,
+  input/output tokens (with a per-scan delta/rate), LLM calls by scope
+  (retain / consolidation / verification), operation counts (retain / recall /
+  reflect / consolidation, with deltas), and process stats (RSS MB, CPU seconds,
+  open FDs, DB pool size). The graph/doc/by-type memory counts come from
+  `GET /v1/default/banks/hermes/stats`. When the service is down you can
   start it from the TUI (`Enter`); when up you can stop it (`S` → `Y`) or apply
   (Enter) the sweep, which PATCH-invalidates stale world/experience memories
   using the correction-aware logic (it never deletes observations — those
