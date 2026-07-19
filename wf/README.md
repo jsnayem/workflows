@@ -56,7 +56,6 @@ No TUI — prints to stdout:
 ```
 wf --list        # repo | branch | ↑ahead/↓behind | clean/dirty | make?
 wf --secrets     # repo | file | reason   (stderr: total count)
-wf --hindsight   # bank totals + dry-run stale count + observations_mission
 ```
 
 ## What it does

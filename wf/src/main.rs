@@ -1,7 +1,7 @@
 //! wf — cross-project management TUI (Ratatui).
 //!
 //! Tabs: Projects | Secrets | Hindsight.
-//! Headless: `wf --list`, `wf --secrets`, `wf --hindsight` (no TUI; for cron/CI).
+//! Headless: `wf --list`, `wf --secrets` (no TUI; for cron/CI).
 mod git;
 mod hindsight;
 mod secrets;
@@ -209,9 +209,6 @@ fn main() -> io::Result<()> {
     }
     if args.iter().any(|a| a == "--secrets") {
         return headless_secrets(&root);
-    }
-    if args.iter().any(|a| a == "--hindsight") {
-        return headless_hindsight();
     }
 
     // ---- TUI ----
@@ -713,10 +710,11 @@ fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
     } else {
         "○ STOPPED".to_string()
     };
+    // One control per line, so they don't run together or overflow.
     let controls = if hi.running {
-        "Enter: run stale-memory sweep   S: stop service"
+        "Enter: run stale-memory sweep\nS: stop service".to_string()
     } else {
-        "Enter: START hindsight-api   (needs the local service up for memory ops)"
+        "Enter: START hindsight-api\n(needs the local service up for memory ops)".to_string()
     };
     let stats = if hi.running {
         format!(
@@ -732,27 +730,50 @@ fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
     } else {
         "Total memories: -\nStale candidates (dry-run): -".to_string()
     };
+    let bottom = if app.confirm_stop {
+        "CONFIRM STOP: press Y to STOP hindsight-api.\nAny other key cancels.".to_string()
+    } else if app.confirm_sweep {
+        "WARNING: press Y to APPLY sweep (invalidates stale\nworld/experience memories). Any other key cancels.".to_string()
+    } else {
+        controls
+    };
     let text = format!(
-        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\n{stats}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\n{stats}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}",
         hindsight::API_URL,
-        hi.observations_mission,
+        wrap(&hi.observations_mission, 72),
         if !app.service_msg.is_empty() {
             format!("Service: {}", app.service_msg)
         } else {
             String::new()
         },
         app.sweep_status,
-        if app.confirm_stop {
-            "CONFIRM STOP: press Y to STOP hindsight-api. Any other key cancels."
-        } else if app.confirm_sweep {
-            "WARNING: press Y to APPLY sweep (invalidates stale world/experience memories). Any other key cancels."
-        } else {
-            controls
-        },
-        controls,
+        bottom,
     );
     let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Hindsight"));
     f.render_widget(p, area);
+}
+
+/// Hard-wrap `text` to lines of at most `width` chars (graceful on long words).
+fn wrap(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        if out.is_empty() {
+            out.push_str(word);
+            continue;
+        }
+        let last = out
+            .rfind('\n')
+            .map(|i| out.len() - i - 1)
+            .unwrap_or(out.len());
+        if last + 1 + word.len() > width {
+            out.push('\n');
+            out.push_str(word);
+        } else {
+            out.push(' ');
+            out.push_str(word);
+        }
+    }
+    out
 }
 
 fn draw_backup(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
@@ -834,22 +855,6 @@ fn headless_secrets(root: &PathBuf) -> io::Result<()> {
         }
     }
     eprintln!("total secret findings: {total}");
-    Ok(())
-}
-
-fn headless_hindsight() -> io::Result<()> {
-    let hi = hindsight::info();
-    println!("running: {}", hi.running);
-    println!("version: {}", hi.version);
-    println!("total_memories: {}", hi.total_memories);
-    println!("total_links: {}", hi.total_links);
-    println!("total_documents: {}", hi.total_documents);
-    println!(
-        "by_type: world={} experience={} observation={}",
-        hi.fact_world, hi.fact_experience, hi.fact_observation
-    );
-    println!("stale_candidates_dry_run: {}", hi.stale_candidates);
-    println!("observations_mission: {}", hi.observations_mission);
     Ok(())
 }
 

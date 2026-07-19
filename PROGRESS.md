@@ -50,12 +50,14 @@ All stats are read live from the local slim API at `http://127.0.0.1:8888`
 
 Code: `wf/src/hindsight.rs` (`BankInfo`, `info()`); render: `wf/src/main.rs`
 `draw_hindsight()`. Verified by `tests::hindsight_panel_renders_status` (renders
-RUNNING + stats into the buffer) and `wf --hindsight` headless mode.
+RUNNING + stats into the buffer). The Hindsight panel is the only place
+statistics are shown — there is intentionally no `wf --hindsight` headless
+mode (the TUI is the single surface; a separate flag would be redundant
+hassle for the user).
 
 ## Verification
 - `cargo test` — render regression tests (tab labels + Hindsight status).
 - `cargo build --release` — produces the binary `~/bin/wf` points at.
-- `wf --hindsight` — headless print of running/version/all stats.
 - Real stop->start cycle exercised against the live service (self-restoring).
 - IMPORTANT: `~/bin/wf` symlinks the **release** binary. After changing wf
   source, rebuild release (`cargo build --release`) or the TUI won't reflect
