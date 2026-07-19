@@ -63,7 +63,7 @@ wf --secrets     # repo | file | reason   (stderr: total count)
 - `↑`/`↓` — move selection
 - `Enter` — context action (run `make check`, start/stop hindsight, run backup)
 - `r` — refresh now · `R` — rebuild + restart (debug only)
-- `t` — **cycle color theme** (dark → nord → high-contrast → mono)
+- `?` / `F1` — **toggle this help overlay** (also shows `? help` hint in the footer)
 - `v` — **toggle verbose** (plain-English captions for technical headings)
 - `S` then `Y` — stop hindsight-api · `Enter` then `Y` — apply stale-memory sweep
 - `q` — quit
