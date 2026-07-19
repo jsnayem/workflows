@@ -39,6 +39,14 @@ Tabs: **[1] Projects | [2] Secrets | [3] Hindsight | [4] Backup** (press the dig
 - `R` — rebuild + restart (dev hot-reload)
 - `q` — quit
 
+### Live auto-refresh
+Beyond the dev hot-reload above, the TUI also keeps its **data** fresh on
+its own: a background worker rescans `~/Projects` (repo health, secrets,
+Hindsight, backup dir) every ~2s and the UI picks it up within a tick —
+so when you `git commit`/`push`/edit a repo, its dirty / ahead / behind
+state updates in the panels **without closing the TUI** (no `r` needed).
+The footer shows `autoscan HH:MM:SS` so you can see it ticking.
+
 ## Headless (for cron / CI)
 No TUI — prints to stdout:
 ```
