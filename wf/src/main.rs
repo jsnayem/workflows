@@ -773,8 +773,31 @@ fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
     } else {
         "LLM/process metrics: n/a (service down)".to_string()
     };
+    // Local models (embedder + reranker) recovered from the API log — these run
+    // locally and emit no /metrics counters (see HINDSIGHT_METRICS_PROPOSAL.md).
+    let local = if !hi.running {
+        "Local models: n/a (service down)".to_string()
+    } else if !hi.log_readable {
+        "Local models: log n/a (set HINDSIGHT_API_LOG if started outside wf)".to_string()
+    } else {
+        let p = &app.prev_hindsight;
+        let dd = |cur: u64, prev: u64| format!(" (+{} /scan)", d64(cur, prev));
+        format!(
+            "Reranker: {} calls{}  {} candidates{}  last {:.1}s\nEmbedder: {} retain units{}  {} query embeds{}  {} consol calls",
+            hi.rerank_calls,
+            dd(hi.rerank_calls, p.rerank_calls),
+            hi.rerank_candidates,
+            dd(hi.rerank_candidates, p.rerank_candidates),
+            hi.rerank_last_secs,
+            hi.embed_retain_units,
+            dd(hi.embed_retain_units, p.embed_retain_units),
+            hi.embed_query_calls,
+            dd(hi.embed_query_calls, p.embed_query_calls),
+            hi.embed_consolidation_calls,
+        )
+    };
     let text = format!(
-        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\n{stats}\n\nLive metrics (from /metrics):\n{metrics}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}",
+        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\n{stats}\n\nLive metrics (from /metrics):\n{metrics}\n\nLocal models (from log):\n{local}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}",
         hindsight::API_URL,
         wrap(&hi.observations_mission, 72),
         if !app.service_msg.is_empty() {

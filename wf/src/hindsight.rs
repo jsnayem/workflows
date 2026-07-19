@@ -58,6 +58,24 @@ pub struct BankInfo {
     pub proc_open_fds: u64,
     /// DB connection pool size.
     pub db_pool_size: u64,
+    // --- local model activity (parsed from API_LOG; NO hindsight changes) ---
+    // The embedder (ONNX) and reranker (cross-encoder) run locally and emit no
+    // /metrics counters, but the recall/retain/consolidation paths log
+    // structured lines. We recover their activity by parsing the log file.
+    /// Reranker (cross-encoder) invocations seen in the log.
+    pub rerank_calls: u64,
+    /// Total candidates scored by the reranker (sum across calls).
+    pub rerank_candidates: u64,
+    /// Most recent reranker latency in seconds (0.0 if none seen).
+    pub rerank_last_secs: f64,
+    /// Units embedded during retain (sum from RETAIN COMPLETE lines).
+    pub embed_retain_units: u64,
+    /// Query embeddings generated during recall (Generate query embedding lines).
+    pub embed_query_calls: u64,
+    /// Embedding calls during consolidation (sum of the "(N calls)" figures).
+    pub embed_consolidation_calls: u64,
+    /// True when the log file was readable (else the block shows "log: n/a").
+    pub log_readable: bool,
 }
 
 /// Run curl, return stdout text on HTTP success (else None).
@@ -131,6 +149,112 @@ fn parse_prometheus(text: &str) -> std::collections::HashMap<String, f64> {
 pub fn metrics() -> Option<std::collections::HashMap<String, f64>> {
     let t = curl_text(&format!("{BASE}/metrics"))?;
     Some(parse_prometheus(&t))
+}
+
+/// Counts recovered from the hindsight-api log (local embedder + reranker
+/// activity that is NOT exposed via /metrics). See HINDSIGHT_METRICS_PROPOSAL.md
+/// Tier B for the rationale and the exact log-line contracts.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityCounters {
+    pub rerank_calls: u64,
+    pub rerank_candidates: u64,
+    pub rerank_last_secs: f64,
+    pub embed_retain_units: u64,
+    pub embed_query_calls: u64,
+    pub embed_consolidation_calls: u64,
+    /// False when the log file could not be read.
+    pub readable: bool,
+}
+
+/// Resolve the API log path (env override, else the default we start with).
+fn api_log_path() -> String {
+    std::env::var("HINDSIGHT_API_LOG").unwrap_or_else(|_| API_LOG.to_string())
+}
+
+/// Parse local-model activity from the hindsight-api log. Pure `wf`-side
+/// workaround (no hindsight changes): the recall/retain/consolidation code
+/// paths already log structured lines even though the ONNX embedder and
+/// cross-encoder reranker emit no Prometheus counters.
+///
+/// Line contracts (anchored on stable tokens):
+///   `  [4] Reranking [cross-encoder]: {N} candidates scored in {X}s ...`
+///   `STREAMING RETAIN COMPLETE: {U} units ...`
+///   `DELTA RETAIN COMPLETE: {U} new units, ...`
+///   `  [1] Generate query embedding: {X}s`
+///   `[4] Timing breakdown: ... embedding={T}s ({C} calls, avg=...) ...`
+pub fn parse_activity_log(path: &str) -> ActivityCounters {
+    let mut a = ActivityCounters::default();
+    // The file is small (truncated on each start) but cap the read for safety.
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return a, // readable stays false
+    };
+    a.readable = true;
+    for line in text.lines() {
+        let l = line.trim();
+        // Reranker: "Reranking [cross-encoder]: 300 candidates scored in 20.971s"
+        if let Some(rest) = l.split_once("Reranking [cross-encoder]:").map(|x| x.1) {
+            a.rerank_calls += 1;
+            // candidates = first integer after the marker
+            if let Some(n) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|w| w.parse::<u64>().ok())
+            {
+                a.rerank_candidates += n;
+            }
+            // latency = number before the trailing 's' in "scored in X.XXXs"
+            if let Some(secs) = rest
+                .split_once("scored in")
+                .map(|x| x.1)
+                .and_then(|s| s.trim().split_whitespace().next())
+                .map(|w| w.trim_end_matches('s'))
+                .and_then(|w| w.parse::<f64>().ok())
+            {
+                a.rerank_last_secs = secs;
+            }
+            continue;
+        }
+        // Retain units embedded: "STREAMING RETAIN COMPLETE: 11 units" or
+        // "DELTA RETAIN COMPLETE: 19 new units, ...".
+        if let Some(rest) = l
+            .split_once("STREAMING RETAIN COMPLETE:")
+            .or_else(|| l.split_once("DELTA RETAIN COMPLETE:"))
+            .map(|x| x.1)
+        {
+            if let Some(n) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|w| w.parse::<u64>().ok())
+            {
+                a.embed_retain_units += n;
+            }
+            continue;
+        }
+        // Recall query embedding: "[1] Generate query embedding: 0.069s"
+        if l.contains("Generate query embedding:") {
+            a.embed_query_calls += 1;
+            continue;
+        }
+        // Consolidation embedding calls: "Timing breakdown: ... embedding=0.910s
+        // (14 calls, avg=65ms), ...". Extract the integer before " calls" that
+        // immediately follows the "embedding=" segment.
+        if l.contains("Timing breakdown:") {
+            if let Some(after_embed) = l.split_once("embedding=").map(|x| x.1) {
+                if let Some(calls) = after_embed
+                    .split_once("(")
+                    .map(|x| x.1)
+                    .and_then(|s| s.split_once(" calls"))
+                    .map(|x| x.0)
+                    .and_then(|w| w.trim().parse::<u64>().ok())
+                {
+                    a.embed_consolidation_calls += calls;
+                }
+            }
+            continue;
+        }
+    }
+    a
 }
 
 /// Redirect a stdio to the API log file, or to /dev/null if it can't be opened.
@@ -331,6 +455,16 @@ pub fn info() -> BankInfo {
             .map(|v| v as u64)
             .unwrap_or(0);
     }
+    // Local-model activity (embedder + reranker) recovered from the API log,
+    // since these run locally and emit no /metrics counters.
+    let act = parse_activity_log(&api_log_path());
+    info.log_readable = act.readable;
+    info.rerank_calls = act.rerank_calls;
+    info.rerank_candidates = act.rerank_candidates;
+    info.rerank_last_secs = act.rerank_last_secs;
+    info.embed_retain_units = act.embed_retain_units;
+    info.embed_query_calls = act.embed_query_calls;
+    info.embed_consolidation_calls = act.embed_consolidation_calls;
     info.stale_candidates = dry_run_sweep_count();
     info
 }
@@ -474,4 +608,47 @@ pub fn apply_sweep() -> (usize, usize) {
         }
     }
     (ok, failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_log_parser_extracts_local_model_counts() {
+        // Synthetic log fragment using the exact stable tokens the parser
+        // anchors on (mirrors real /tmp/hindsight-api.log lines).
+        let sample = "\
+2026-07-19 09:01 - INFO - [1] Generate query embedding: 0.069s
+  [4] Reranking [cross-encoder]: 300 candidates scored in 20.971s (pre-filtered 19)
+STREAMING RETAIN COMPLETE: 11 units across 1 batches in 37.231s
+DELTA RETAIN COMPLETE: 19 new units, 54 chunks unchanged in 46.492s
+  [1] Generate query embedding: 0.045s
+  [4] Reranking [cross-encoder]: 296 candidates scored in 56.792s
+[4] Timing breakdown: recall=7.760s (3 calls), llm=63.082s (3 calls), embedding=0.910s (14 calls, avg=65ms), db_write=0.057s
+some unrelated line that should be ignored
+";
+        let tmp = std::env::temp_dir().join("wf_activity_log_test.log");
+        std::fs::write(&tmp, sample).unwrap();
+        let a = parse_activity_log(tmp.to_str().unwrap());
+        std::fs::remove_file(&tmp).ok();
+
+        assert!(a.readable);
+        assert_eq!(a.rerank_calls, 2, "two reranker lines");
+        assert_eq!(a.rerank_candidates, 300 + 296, "candidates summed");
+        assert!(
+            (a.rerank_last_secs - 56.792).abs() < 1e-6,
+            "last rerank latency is the most recent line"
+        );
+        assert_eq!(a.embed_retain_units, 11 + 19, "retain units summed");
+        assert_eq!(a.embed_query_calls, 2, "two query-embedding lines");
+        assert_eq!(a.embed_consolidation_calls, 14, "consolidation embed calls");
+    }
+
+    #[test]
+    fn activity_log_missing_file_is_not_readable() {
+        let a = parse_activity_log("/nonexistent/path/hindsight.log");
+        assert!(!a.readable);
+        assert_eq!(a.rerank_calls, 0);
+    }
 }
