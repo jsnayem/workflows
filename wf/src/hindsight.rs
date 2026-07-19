@@ -23,6 +23,15 @@ pub struct BankInfo {
     pub total_memories: u64,
     pub observations_mission: String,
     pub stale_candidates: usize,
+    // --- live bank statistics (from GET /v1/default/banks/{bank}/stats) ---
+    /// Total edges/relationships across the memory graph.
+    pub total_links: u64,
+    /// Number of source documents ingested into the bank.
+    pub total_documents: u64,
+    /// Count of memory units by type: world / experience / observation.
+    pub fact_world: u64,
+    pub fact_experience: u64,
+    pub fact_observation: u64,
 }
 
 /// Run curl, return stdout text on HTTP success (else None).
@@ -169,6 +178,20 @@ pub fn info() -> BankInfo {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
+        }
+    }
+    // Live bank statistics from the /stats endpoint (graph size, document
+    // count, and memory-unit breakdown by fact type).
+    if let Some(s) = curl_json(&format!("{BASE}/v1/default/banks/{BANK}/stats")) {
+        info.total_links = s.get("total_links").and_then(|t| t.as_u64()).unwrap_or(0);
+        info.total_documents = s
+            .get("total_documents")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        if let Some(ft) = s.get("nodes_by_fact_type").and_then(|t| t.as_object()) {
+            info.fact_world = ft.get("world").and_then(|t| t.as_u64()).unwrap_or(0);
+            info.fact_experience = ft.get("experience").and_then(|t| t.as_u64()).unwrap_or(0);
+            info.fact_observation = ft.get("observation").and_then(|t| t.as_u64()).unwrap_or(0);
         }
     }
     info.stale_candidates = dry_run_sweep_count();

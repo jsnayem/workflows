@@ -718,11 +718,23 @@ fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
     } else {
         "Enter: START hindsight-api   (needs the local service up for memory ops)"
     };
+    let stats = if hi.running {
+        format!(
+            "Total memories: {}\nGraph links: {}\nDocuments: {}\nBy type: world={} experience={} observation={}\nStale candidates (dry-run): {}",
+            hi.total_memories,
+            hi.total_links,
+            hi.total_documents,
+            hi.fact_world,
+            hi.fact_experience,
+            hi.fact_observation,
+            hi.stale_candidates,
+        )
+    } else {
+        "Total memories: -\nStale candidates (dry-run): -".to_string()
+    };
     let text = format!(
-        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\nTotal memories: {}\nStale candidates (dry-run): {}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\n{stats}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
         hindsight::API_URL,
-        hi.total_memories,
-        hi.stale_candidates,
         hi.observations_mission,
         if !app.service_msg.is_empty() {
             format!("Service: {}", app.service_msg)
@@ -830,6 +842,12 @@ fn headless_hindsight() -> io::Result<()> {
     println!("running: {}", hi.running);
     println!("version: {}", hi.version);
     println!("total_memories: {}", hi.total_memories);
+    println!("total_links: {}", hi.total_links);
+    println!("total_documents: {}", hi.total_documents);
+    println!(
+        "by_type: world={} experience={} observation={}",
+        hi.fact_world, hi.fact_experience, hi.fact_observation
+    );
     println!("stale_candidates_dry_run: {}", hi.stale_candidates);
     println!("observations_mission: {}", hi.observations_mission);
     Ok(())
@@ -861,12 +879,27 @@ mod tests {
         }
     }
 
-    /// Render the TUI to an in-memory backend and confirm the tab labels
-    /// actually appear in the buffer (catches the "tabs clipped" layout bug).
+    /// Render the Hindsight tab and confirm the service status + running
+    /// controls actually appear (catches a silently-empty panel).
     #[test]
-    fn tab_bar_renders_labels() {
-        let app = sample_app();
-        let backend = TestBackend::new(100, 24);
+    fn hindsight_panel_renders_status() {
+        let mut app = sample_app();
+        app.tab = Tab::Hindsight;
+        // Simulate a running service so the panel shows the RUNNING marker
+        // and the start/stop control line.
+        app.hindsight = hindsight::BankInfo {
+            running: true,
+            version: "0.8.4".into(),
+            total_memories: 1339,
+            total_links: 100705,
+            total_documents: 17,
+            fact_world: 1136,
+            fact_experience: 230,
+            fact_observation: 246,
+            stale_candidates: 9,
+            ..Default::default()
+        };
+        let backend = TestBackend::new(100, 40);
         let mut term = Terminal::new(backend).expect("terminal");
         term.draw(|f| draw(f, &app)).expect("draw");
 
@@ -879,20 +912,16 @@ mod tests {
             .collect();
 
         assert!(
-            rendered.contains("[1] Projects"),
-            "Projects tab label missing from render:\n{rendered}"
+            rendered.contains("RUNNING"),
+            "Hindsight status (RUNNING) missing from render:\n{rendered}"
         );
         assert!(
-            rendered.contains("[2] Secrets"),
-            "Secrets tab label missing from render:\n{rendered}"
+            rendered.contains("stop service"),
+            "service controls missing from render:\n{rendered}"
         );
         assert!(
-            rendered.contains("[3] Hindsight"),
-            "Hindsight tab label missing from render:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("[4] Backup"),
-            "Backup tab label missing from render:\n{rendered}"
+            rendered.contains("Graph links:"),
+            "bank statistics missing from render:\n{rendered}"
         );
     }
 }

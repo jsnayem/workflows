@@ -70,11 +70,13 @@ wf --hindsight   # bank totals + dry-run stale count + observations_mission
   long non-placeholder values). Read-only.
 - **Hindsight**: reads the local `hermes` bank at `localhost:8888`; shows a live
   **running/stopped** status (polls `/health` every ~2s), version, totals, and a
-  **dry-run** stale count. When the service is down you can start it from the TUI
-  (`Enter`); when up you can stop it (`S` → `Y`) or apply (Enter) the sweep, which
-  PATCH-invalidates stale world/experience memories using the correction-aware
-  logic (it never deletes observations — those regenerate per the
-  `observations_mission`).
+  **dry-run** stale count, and a live statistics block (graph links, documents,
+  and memory-unit counts by type: world / experience / observation — all pulled
+  from `GET /v1/default/banks/hermes/stats`). When the service is down you can
+  start it from the TUI (`Enter`); when up you can stop it (`S` → `Y`) or apply
+  (Enter) the sweep, which PATCH-invalidates stale world/experience memories
+  using the correction-aware logic (it never deletes observations — those
+  regenerate per the `observations_mission`).
 - **Backup**: launches the existing `backup.sh` SOP (rsync media + sqlite
   `VACUUM` dump from remote servers `cs`/`ss` into `~/Projects/Backups`).
   Shows a snapshot of the local backup dir; `Enter` runs the script and
