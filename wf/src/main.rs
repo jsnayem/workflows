@@ -146,6 +146,46 @@ struct App {
     backup_list: String,
     confirm_sweep: bool,
     status: String,
+    // wall-clock of the last live rescan (shown in the footer so you can see it tick)
+    last_scan: String,
+}
+
+/// Snapshot of everything the panels render, recomputed by the background
+/// rescan worker. Cloning is cheap (a handful of small vecs).
+#[derive(Clone, Default)]
+struct ScanData {
+    repos: Vec<git::Repo>,
+    secrets: Vec<secrets::Finding>,
+    hindsight: hindsight::BankInfo,
+    backup_list: String,
+    stamp: String,
+}
+
+/// Full rescan of ~/Projects (repo health, secrets, hindsight, backup dir).
+fn scan_all(root: &PathBuf) -> ScanData {
+    let repos = load_repos(root);
+    let secrets = git::discover(root)
+        .iter()
+        .flat_map(|p| secrets::scan_repo(p))
+        .collect();
+    ScanData {
+        repos,
+        secrets,
+        hindsight: hindsight::info(),
+        backup_list: backup_snapshot(),
+        stamp: chrono_now(),
+    }
+}
+
+/// `HH:MM:SS` local time, for the live-rescan footer stamp.
+fn chrono_now() -> String {
+    // std-only: format the unix timestamp as HH:MM:SS.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (h, m, s) = (secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 #[derive(Debug, Default, Clone)]
@@ -186,29 +226,56 @@ fn main() -> io::Result<()> {
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
         };
 
-    let repos = load_repos(&root);
-    let secrets_findings = git::discover(&root)
-        .iter()
-        .flat_map(|p| secrets::scan_repo(p))
-        .collect();
-    let hi = hindsight::info();
+    // Initial scan, plus a background worker that rescans ~/Projects every
+    // few seconds so repo git-state changes (commit/push/dirty) show up
+    // live without closing the TUI.
+    let shared_scan: Arc<Mutex<ScanData>> = Arc::new(Mutex::new(scan_all(&root)));
+    {
+        let shared = Arc::clone(&shared_scan);
+        let root2 = root.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let data = scan_all(&root2);
+            *shared.lock().unwrap() = data;
+        });
+    }
 
+    let init = shared_scan.lock().unwrap().clone();
     let mut app = App {
         tab: Tab::Projects,
-        repos,
+        repos: init.repos,
         selected: 0,
         check: Arc::new(Mutex::new(CheckState::default())),
-        secrets: secrets_findings,
-        hindsight: hi,
+        secrets: init.secrets,
+        hindsight: init.hindsight,
         sweep_status: String::new(),
         backup: Arc::new(Mutex::new(CheckState::default())),
-        backup_list: backup_snapshot(),
+        backup_list: init.backup_list,
         confirm_sweep: false,
         status: HELP.into(),
+        last_scan: init.stamp,
     };
 
     loop {
         term.draw(|f| draw(f, &app))?;
+
+        // Live data refresh: copy the latest background rescan into `app`
+        // every tick (~5x/sec), so a repo's git state changing on disk
+        // (commit/push/dirty) shows up without closing the TUI. We only
+        // swap when the stamp changed, to avoid churning `selected`.
+        {
+            let s = shared_scan.lock().unwrap();
+            if s.stamp != app.last_scan {
+                app.repos = s.repos.clone();
+                if app.selected >= app.repos.len() {
+                    app.selected = app.repos.len().saturating_sub(1);
+                }
+                app.secrets = s.secrets.clone();
+                app.hindsight = s.hindsight.clone();
+                app.backup_list = s.backup_list.clone();
+                app.last_scan = s.stamp.clone();
+            }
+        }
 
         // Dev hot-reload: if the watcher rebuilt the binary, restart in place.
         // Checked on every tick (not just after a keypress) so the TUI reloads
@@ -316,16 +383,15 @@ fn next_tab(t: &Tab) -> Tab {
 }
 
 fn refresh(app: &mut App, root: &PathBuf) {
-    app.repos = load_repos(root);
+    let data = scan_all(root);
+    app.repos = data.repos;
     if app.selected >= app.repos.len() {
         app.selected = app.repos.len().saturating_sub(1);
     }
-    app.secrets = git::discover(root)
-        .iter()
-        .flat_map(|p| secrets::scan_repo(p))
-        .collect();
-    app.hindsight = hindsight::info();
-    app.backup_list = backup_snapshot();
+    app.secrets = data.secrets;
+    app.hindsight = data.hindsight;
+    app.backup_list = data.backup_list;
+    app.last_scan = data.stamp;
     app.status = "refreshed".into();
 }
 
@@ -463,7 +529,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Tab::Backup => draw_backup(f, app, chunks[1]),
     }
 
-    let footer = format!("wf v{VERSION}  |  {}\n{}", app.status, HELP);
+    let footer = format!(
+        "wf v{VERSION}  |  autoscan {}\n{}",
+        app.last_scan, app.status
+    );
     let status = Paragraph::new(footer).block(Block::default().borders(Borders::ALL));
     f.render_widget(status, chunks[2]);
 }
@@ -694,6 +763,7 @@ mod tests {
             backup_list: String::new(),
             confirm_sweep: false,
             status: String::new(),
+            last_scan: String::new(),
         }
     }
 
