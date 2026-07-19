@@ -209,77 +209,86 @@ fn main() -> io::Result<()> {
 
     loop {
         term.draw(|f| draw(f, &app))?;
-        if let Event::Key(key) = event::read()? {
-            // Dev hot-reload: if the watcher rebuilt the binary, restart in place.
-            #[cfg(all(unix, debug_assertions))]
-            {
-                if reload_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                    dev_watch::reexec();
-                    // reexec replaces the process; we never reach here on success.
-                    return crossterm::terminal::disable_raw_mode();
-                }
+
+        // Dev hot-reload: if the watcher rebuilt the binary, restart in place.
+        // Checked on every tick (not just after a keypress) so the TUI reloads
+        // in realtime while you watch — no keypress needed.
+        #[cfg(all(unix, debug_assertions))]
+        {
+            if reload_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                dev_watch::reexec();
+                // reexec replaces the process; we never reach here on success.
+                return crossterm::terminal::disable_raw_mode();
             }
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Char('1') => {
-                    app.tab = Tab::Projects;
-                    app.confirm_sweep = false;
-                }
-                KeyCode::Char('2') => {
-                    app.tab = Tab::Secrets;
-                    app.confirm_sweep = false;
-                }
-                KeyCode::Char('3') => {
-                    app.tab = Tab::Hindsight;
-                    app.confirm_sweep = false;
-                }
-                KeyCode::Char('4') => {
-                    app.tab = Tab::Backup;
-                    app.confirm_sweep = false;
-                }
-                KeyCode::Left | KeyCode::Char('h') => {
-                    app.tab = prev_tab(&app.tab);
-                    app.confirm_sweep = false;
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    app.tab = next_tab(&app.tab);
-                    app.confirm_sweep = false;
-                }
-                KeyCode::Up => {
-                    if app.selected > 0 {
-                        app.selected -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    let n = match app.tab {
-                        Tab::Projects => app.repos.len(),
-                        Tab::Secrets => app.secrets.len(),
-                        Tab::Hindsight => 1,
-                        Tab::Backup => 1,
-                    };
-                    if n > 0 && app.selected < n - 1 {
-                        app.selected += 1;
-                    }
-                }
-                KeyCode::Char('r') => refresh(&mut app, &root),
-                // Dev: hard restart — rebuild now and re-exec the fresh binary.
-                #[cfg(all(unix, debug_assertions))]
-                KeyCode::Char('R') => {
-                    let _ = std::process::Command::new("cargo")
-                        .arg("build")
-                        .current_dir(env!("CARGO_MANIFEST_DIR"))
-                        .status();
-                    dev_watch::reexec();
-                    return crossterm::terminal::disable_raw_mode();
-                }
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if app.confirm_sweep {
-                        apply_sweep(&mut app);
+        }
+
+        // Poll (non-blocking) with a short timeout so the loop wakes on its own
+        // ~5x/sec to re-check the reload flag, instead of blocking forever on
+        // event::read().
+        if event::poll(std::time::Duration::from_millis(200))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('1') => {
+                        app.tab = Tab::Projects;
                         app.confirm_sweep = false;
                     }
+                    KeyCode::Char('2') => {
+                        app.tab = Tab::Secrets;
+                        app.confirm_sweep = false;
+                    }
+                    KeyCode::Char('3') => {
+                        app.tab = Tab::Hindsight;
+                        app.confirm_sweep = false;
+                    }
+                    KeyCode::Char('4') => {
+                        app.tab = Tab::Backup;
+                        app.confirm_sweep = false;
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        app.tab = prev_tab(&app.tab);
+                        app.confirm_sweep = false;
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        app.tab = next_tab(&app.tab);
+                        app.confirm_sweep = false;
+                    }
+                    KeyCode::Up => {
+                        if app.selected > 0 {
+                            app.selected -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        let n = match app.tab {
+                            Tab::Projects => app.repos.len(),
+                            Tab::Secrets => app.secrets.len(),
+                            Tab::Hindsight => 1,
+                            Tab::Backup => 1,
+                        };
+                        if n > 0 && app.selected < n - 1 {
+                            app.selected += 1;
+                        }
+                    }
+                    KeyCode::Char('r') => refresh(&mut app, &root),
+                    // Dev: hard restart — rebuild now and re-exec the fresh binary.
+                    #[cfg(all(unix, debug_assertions))]
+                    KeyCode::Char('R') => {
+                        let _ = std::process::Command::new("cargo")
+                            .arg("build")
+                            .current_dir(env!("CARGO_MANIFEST_DIR"))
+                            .status();
+                        dev_watch::reexec();
+                        return crossterm::terminal::disable_raw_mode();
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if app.confirm_sweep {
+                            apply_sweep(&mut app);
+                            app.confirm_sweep = false;
+                        }
+                    }
+                    KeyCode::Enter => handle_enter(&mut app),
+                    _ => {}
                 }
-                KeyCode::Enter => handle_enter(&mut app),
-                _ => {}
             }
         }
     }
