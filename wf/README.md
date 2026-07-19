@@ -9,9 +9,24 @@ cargo build --release
 ```
 
 ## Run (TUI)
-```
+```bash
+cargo build        # debug build (enables dev hot-reload)
 ./target/debug/wf
 ```
+> Note: run the **debug** binary (`target/debug/wf`) for development. The
+> auto-reload described below is compiled in only for `debug` builds.
+
+### Dev hot-reload (debug builds only)
+When you run `./target/debug/wf`, a background thread watches the crate
+source (`Cargo.toml`, `Cargo.lock`, `src/*.rs`). On any save it rebuilds
+with `cargo build` and — on your **next keypress** — re-execs the freshly
+built binary in place (terminal-safe: it leaves raw mode / the alt screen
+first, then `execve`s the new binary, so your TTY is never corrupted).
+- No extra tooling needed (`cargo-watch`/`entr`/`inotifywait` not required).
+- Press **`R`** for a manual hard restart: rebuild *now* and re-exec immediately.
+- Set `WF_NO_WATCH=1 ./target/debug/wf` to disable the watcher.
+- Release builds (`cargo build --release`) exclude all of this — zero overhead.
+
 Tabs: **[1] Projects | [2] Secrets | [3] Hindsight | [4] Backup** (press the digit to jump)
 - `←/→` or `h/l` — cycle tabs
 - `↑/↓` — move selection
@@ -21,6 +36,7 @@ Tabs: **[1] Projects | [2] Secrets | [3] Hindsight | [4] Backup** (press the dig
   - Hindsight: **apply** the stale-memory sweep (PATCH-invalidates uncorrected stale world/experience memories)
   - Backup: **run** `backup.sh` (pulls remote `cs`/`ss` → `~/Projects/Backups`; output pops up)
 - `r` — refresh all panels
+- `R` — rebuild + restart (dev hot-reload)
 - `q` — quit
 
 ## Headless (for cron / CI)
