@@ -19,11 +19,111 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+/// Dev-only (debug + unix) hot-reload. A background thread watches the source
+/// files; on change it rebuilds with `cargo build` and signals the main loop,
+/// which tears down the TUI and re-execs the fresh binary in place. Disabled in
+/// release builds and when WF_NO_WATCH is set.
+#[cfg(all(unix, debug_assertions))]
+mod dev_watch {
+    use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const SOURCES: &[&str] = &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "src/main.rs",
+        "src/git.rs",
+        "src/secrets.rs",
+        "src/hindsight.rs",
+    ];
+
+    fn manifest_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Newest mtime across the crate's source files.
+    fn latest_source_mtime() -> SystemTime {
+        let dir = manifest_dir();
+        let mut latest = UNIX_EPOCH;
+        for f in SOURCES {
+            if let Ok(m) = std::fs::metadata(dir.join(f)).and_then(|m| m.modified()) {
+                if m > latest {
+                    latest = m;
+                }
+            }
+        }
+        latest
+    }
+
+    /// Spawn the watcher. On a successful rebuild it flips `reload` to true.
+    ///
+    /// We compare the current source mtime against the mtime we last *built*
+    /// (not against the running binary's own mtime, which isn't reliably
+    /// readable). A `building` guard prevents overlapping `cargo` runs.
+    pub fn spawn(reload: Arc<AtomicBool>) {
+        std::thread::spawn(move || {
+            // Seed with the source mtime at startup so we don't rebuild immediately.
+            let last_built: Arc<Mutex<SystemTime>> = Arc::new(Mutex::new(latest_source_mtime()));
+            let building: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let now = latest_source_mtime();
+                let mut last = last_built.lock().unwrap();
+                let mut busy = building.lock().unwrap();
+                if *busy || now <= *last {
+                    continue;
+                }
+                *busy = true;
+                drop(busy);
+                let status = Command::new("cargo")
+                    .arg("build")
+                    .current_dir(manifest_dir())
+                    .status();
+                *last = latest_source_mtime();
+                let mut busy = building.lock().unwrap();
+                *busy = false;
+                drop(busy);
+                if let Ok(s) = status {
+                    if s.success() {
+                        reload.store(true, Ordering::SeqCst);
+                    }
+                    // On build failure: keep the old binary running.
+                }
+            }
+        });
+    }
+
+    /// Tear down the TUI and re-exec the freshly built binary (self-replacing).
+    /// Replaces the process image; only returns (as an error) on failure.
+    ///
+    /// We re-exec the stable `target/debug/wf` path (derived from the manifest
+    /// dir) rather than `std::env::current_exe()`: `cargo build` *unlinks* the
+    /// old binary and creates a new inode, so the running process's
+    /// `/proc/exe` is a stale "(deleted)" path that can't be exec'd.
+    pub fn reexec() -> std::io::Error {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        let exe = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target/debug/wf"));
+        if !exe.exists() {
+            return std::io::Error::new(std::io::ErrorKind::NotFound, "target/debug/wf missing");
+        }
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut cmd = Command::new(exe);
+        cmd.args(args);
+        cmd.exec() // never returns on success
+    }
+}
+
 const PROJECTS_ROOT: &str = "/home/nayem/Projects";
 const BACKUP_SH: &str = "/home/nayem/Projects/workflows/backup.sh";
 const BACKUP_DIR: &str = "/home/nayem/Projects/Backups";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const HELP: &str = "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | q quit";
+const HELP: &str =
+    "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | R rebuild+restart | q quit";
 
 #[derive(Debug, Clone)]
 enum Tab {
@@ -75,6 +175,17 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
 
+    // Dev hot-reload: watch source, rebuild, re-exec this binary on change.
+    #[cfg(all(unix, debug_assertions))]
+    let reload_flag: std::sync::Arc<std::sync::atomic::AtomicBool> =
+        if std::env::var_os("WF_NO_WATCH").is_none() {
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            dev_watch::spawn(std::sync::Arc::clone(&flag));
+            flag
+        } else {
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+        };
+
     let repos = load_repos(&root);
     let secrets_findings = git::discover(&root)
         .iter()
@@ -99,6 +210,15 @@ fn main() -> io::Result<()> {
     loop {
         term.draw(|f| draw(f, &app))?;
         if let Event::Key(key) = event::read()? {
+            // Dev hot-reload: if the watcher rebuilt the binary, restart in place.
+            #[cfg(all(unix, debug_assertions))]
+            {
+                if reload_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    dev_watch::reexec();
+                    // reexec replaces the process; we never reach here on success.
+                    return crossterm::terminal::disable_raw_mode();
+                }
+            }
             match key.code {
                 KeyCode::Char('q') => break,
                 KeyCode::Char('1') => {
@@ -142,6 +262,16 @@ fn main() -> io::Result<()> {
                     }
                 }
                 KeyCode::Char('r') => refresh(&mut app, &root),
+                // Dev: hard restart — rebuild now and re-exec the fresh binary.
+                #[cfg(all(unix, debug_assertions))]
+                KeyCode::Char('R') => {
+                    let _ = std::process::Command::new("cargo")
+                        .arg("build")
+                        .current_dir(env!("CARGO_MANIFEST_DIR"))
+                        .status();
+                    dev_watch::reexec();
+                    return crossterm::terminal::disable_raw_mode();
+                }
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if app.confirm_sweep {
                         apply_sweep(&mut app);
