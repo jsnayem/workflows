@@ -123,7 +123,7 @@ const BACKUP_SH: &str = "/home/nayem/Projects/workflows/backup.sh";
 const BACKUP_DIR: &str = "/home/nayem/Projects/Backups";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const HELP: &str =
-    "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | R rebuild+restart | q quit";
+    "1/2/3/4 tabs | ↑↓ select | Enter action | r refresh | R rebuild+restart | q quit | Hindsight: Enter start / S stop";
 
 #[derive(Debug, Clone)]
 enum Tab {
@@ -145,7 +145,13 @@ struct App {
     backup: Arc<Mutex<CheckState>>,
     backup_list: String,
     confirm_sweep: bool,
+    confirm_stop: bool,
     status: String,
+    // hindsight service control feedback (start/stop result)
+    service_msg: String,
+    // shared channel the start thread writes its outcome to (so the TUI
+    // can pick it up on the next live-rescan tick)
+    hindsight_status: Arc<Mutex<String>>,
     // wall-clock of the last live rescan (shown in the footer so you can see it tick)
     last_scan: String,
 }
@@ -252,7 +258,10 @@ fn main() -> io::Result<()> {
         backup: Arc::new(Mutex::new(CheckState::default())),
         backup_list: init.backup_list,
         confirm_sweep: false,
+        confirm_stop: false,
         status: HELP.into(),
+        service_msg: String::new(),
+        hindsight_status: Arc::new(Mutex::new(String::new())),
         last_scan: init.stamp,
     };
 
@@ -274,6 +283,19 @@ fn main() -> io::Result<()> {
                 app.hindsight = s.hindsight.clone();
                 app.backup_list = s.backup_list.clone();
                 app.last_scan = s.stamp.clone();
+            }
+        }
+
+        // Pick up the hindsight start outcome once the worker thread finishes.
+        {
+            let s = app.hindsight_status.lock().unwrap();
+            if !s.is_empty() {
+                app.service_msg = s.clone();
+                app.status = s.clone();
+                // refresh the panel's running flag immediately
+                app.hindsight = hindsight::info();
+                drop(s);
+                *app.hindsight_status.lock().unwrap() = String::new();
             }
         }
 
@@ -347,14 +369,29 @@ fn main() -> io::Result<()> {
                         dev_watch::reexec();
                         return crossterm::terminal::disable_raw_mode();
                     }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        // hindsight service stop requires confirmation (destructive)
+                        if let Tab::Hindsight = app.tab {
+                            app.confirm_stop = true;
+                            app.status =
+                                "Press Y to STOP hindsight-api; any other key cancels".into();
+                        }
+                    }
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        if app.confirm_sweep {
+                        if app.confirm_stop {
+                            run_hindsight_stop(&mut app);
+                            app.confirm_stop = false;
+                        } else if app.confirm_sweep {
                             apply_sweep(&mut app);
                             app.confirm_sweep = false;
                         }
                     }
                     KeyCode::Enter => handle_enter(&mut app),
-                    _ => {}
+                    _ => {
+                        // Any other key cancels a pending stop confirmation
+                        // (Y is handled above; everything else dismisses it).
+                        app.confirm_stop = false;
+                    }
                 }
             }
         }
@@ -439,10 +476,19 @@ fn handle_enter(app: &mut App) {
             );
         }
         Tab::Hindsight => {
-            // two-step: Enter prompts, Y confirms (mutating action)
-            app.confirm_sweep = true;
-            app.status =
-                "Press Y to APPLY sweep (invalidates stale memories); any other key cancels".into();
+            // Enter on the Hindsight tab starts the service if it is down
+            // (non-destructive: just launches the API). Stopping is a
+            // deliberate S/Y action, confirmed before it runs.
+            let hi = app.hindsight.clone();
+            if !hi.running {
+                run_hindsight_start(app);
+            } else {
+                // already running: reuse the two-step sweep confirmation
+                app.confirm_sweep = true;
+                app.status =
+                    "Press Y to APPLY sweep (invalidates stale memories); any other key cancels"
+                        .into();
+            }
         }
         Tab::Backup => {
             let sh = BACKUP_SH.to_string();
@@ -481,6 +527,30 @@ fn apply_sweep(app: &mut App) {
     app.sweep_status = format!("sweep applied: invalidated={ok} failed={failed}");
     app.hindsight = hindsight::info();
     app.status = format!("hindsight sweep applied (invalidated={ok}, failed={failed})");
+}
+
+/// Start the hindsight-api service (detached). Runs on a worker thread while
+/// polling for readiness (startup can take ~30s: ONNX model + migrations). The
+/// outcome string is written to a shared channel the main loop picks up.
+fn run_hindsight_start(app: &mut App) {
+    app.confirm_sweep = false;
+    app.service_msg = "starting hindsight-api…".into();
+    app.status = "starting hindsight-api (this can take ~30s)".into();
+    let shared: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    app.hindsight_status = Arc::clone(&shared);
+    thread::spawn(move || {
+        let msg = hindsight::start();
+        let mut s = shared.lock().unwrap();
+        *s = msg;
+    });
+}
+
+/// Stop the hindsight-api service. Runs synchronously (kill is fast).
+fn run_hindsight_stop(app: &mut App) {
+    let msg = hindsight::stop();
+    app.service_msg = msg.clone();
+    app.hindsight = hindsight::info();
+    app.status = msg;
 }
 
 /// Snapshot of the local backup dir for the Backup tab (read-only `ls`).
@@ -638,17 +708,36 @@ fn draw_secrets(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) 
 
 fn draw_hindsight(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let hi = &app.hindsight;
+    let state_line = if hi.running {
+        format!("● RUNNING  (v{})", hi.version)
+    } else {
+        "○ STOPPED".to_string()
+    };
+    let controls = if hi.running {
+        "Enter: run stale-memory sweep   S: stop service"
+    } else {
+        "Enter: START hindsight-api   (needs the local service up for memory ops)"
+    };
     let text = format!(
-        "Bank: hermes @ localhost:8888\nTotal memories: {}\nStale candidates (dry-run): {}\n\nObservations mission:\n{}\n\n{}\n\n{}",
+        "Status: {state_line}\nURL: {}/health\n\nBank hermes @ localhost:8888\nTotal memories: {}\nStale candidates (dry-run): {}\n\nObservations mission:\n{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        hindsight::API_URL,
         hi.total_memories,
         hi.stale_candidates,
         hi.observations_mission,
+        if !app.service_msg.is_empty() {
+            format!("Service: {}", app.service_msg)
+        } else {
+            String::new()
+        },
         app.sweep_status,
-        if app.confirm_sweep {
+        if app.confirm_stop {
+            "CONFIRM STOP: press Y to STOP hindsight-api. Any other key cancels."
+        } else if app.confirm_sweep {
             "WARNING: press Y to APPLY sweep (invalidates stale world/experience memories). Any other key cancels."
         } else {
-            "Enter: review the stale-memory sweep (asks for confirmation before applying)."
+            controls
         },
+        controls,
     );
     let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Hindsight"));
     f.render_widget(p, area);
@@ -738,6 +827,8 @@ fn headless_secrets(root: &PathBuf) -> io::Result<()> {
 
 fn headless_hindsight() -> io::Result<()> {
     let hi = hindsight::info();
+    println!("running: {}", hi.running);
+    println!("version: {}", hi.version);
     println!("total_memories: {}", hi.total_memories);
     println!("stale_candidates_dry_run: {}", hi.stale_candidates);
     println!("observations_mission: {}", hi.observations_mission);
@@ -762,7 +853,10 @@ mod tests {
             backup: Arc::new(Mutex::new(CheckState::default())),
             backup_list: String::new(),
             confirm_sweep: false,
+            confirm_stop: false,
             status: String::new(),
+            service_msg: String::new(),
+            hindsight_status: Arc::new(Mutex::new(String::new())),
             last_scan: String::new(),
         }
     }
